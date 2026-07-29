@@ -281,7 +281,7 @@ traits as the owned trees.
 
 ```rust
 use qwt::bytes::{qwt256_to_bytes, qwt256_from_bytes, QwtView, AlignedBytes};
-use qwt::{AccessUnsigned, QWT256};
+use qwt::{AccessUnsigned, RankUnsigned, QWT256};
 
 let qwt = QWT256::from(vec![1u8, 0, 1, 0, 2, 4, 5, 3]);
 
