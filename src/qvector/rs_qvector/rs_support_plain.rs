@@ -321,7 +321,7 @@ impl SuperblockPlain {
         }
     }
 
-    fn get_block_counter(&self, symbol: u8, block_id: usize) -> usize {
+    pub(crate) fn get_block_counter(&self, symbol: u8, block_id: usize) -> usize {
         debug_assert!(block_id < Self::BLOCKS_IN_SUPERBLOCK);
 
         if block_id == 0 {

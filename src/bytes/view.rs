@@ -934,6 +934,41 @@ mod tests {
     }
 
     #[test]
+    fn qwt_view_rejects_non_monotone_child_offsets() {
+        let original = QWT256::from((0..1000).map(|x| (x * 3) % 64).collect::<Vec<u32>>());
+        let mut bytes = qwt256_to_bytes(&original).unwrap();
+        // First LevelDir.n_occs_smaller[0] must be zero.
+        bytes[HEADER_SIZE + 88..HEADER_SIZE + 96].copy_from_slice(&1u64.to_le_bytes());
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let error = QwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
+    }
+
+    #[test]
+    fn qwt_view_rejects_missing_select_sentinels() {
+        let original = QWT256::from((0..1000).map(|x| (x * 3) % 64).collect::<Vec<u32>>());
+        let mut bytes = qwt256_to_bytes(&original).unwrap();
+        // First LevelDir.n_sel[0] must include the initial sample and sentinel.
+        bytes[HEADER_SIZE + 72..HEADER_SIZE + 76].copy_from_slice(&1u32.to_le_bytes());
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let error = QwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
+    }
+
+    #[test]
+    fn qwt_view_rejects_out_of_bounds_rank_metadata() {
+        let original = QWT256::from((0..1000).map(|x| (x * 3) % 64).collect::<Vec<u32>>());
+        let mut bytes = qwt256_to_bytes(&original).unwrap();
+        let sb_field = HEADER_SIZE + 24;
+        let sb_offset =
+            u64::from_le_bytes(bytes[sb_field..sb_field + 8].try_into().unwrap()) as usize;
+        bytes[sb_offset..sb_offset + 16].fill(0xff);
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let error = QwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
+    }
+
+    #[test]
     fn hqwt_view_matches_owned() {
         let data: Vec<u32> = (0..500).map(|x| (x * 7) % 64).collect();
         let original = HQWT256::from(data.clone());
@@ -1110,5 +1145,5 @@ mod tests {
             );
         }
     }
-}
 
+}

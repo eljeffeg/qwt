@@ -183,6 +183,82 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
                 detail: "position_bits exceeds data capacity",
             });
         }
+        let len = position_bits >> 1;
+        if n_occs_smaller[0] != 0
+            || n_occs_smaller[4] != len
+            || n_occs_smaller.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            return Err(LayoutError::Inconsistent {
+                detail: "child offsets must be monotone from zero through the level length",
+            });
+        }
+
+        let expected_superblocks =
+            (len + B_SIZE * BLOCKS_IN_SUPERBLOCK) / (B_SIZE * BLOCKS_IN_SUPERBLOCK);
+        if n_sb != expected_superblocks {
+            return Err(LayoutError::Inconsistent {
+                detail: "superblock count does not match the level length",
+            });
+        }
+        let last_superblock = n_sb.checked_sub(1).ok_or(LayoutError::Inconsistent {
+            detail: "non-empty level must contain a superblock",
+        })?;
+        for symbol in 0..4 {
+            let samples = select_samples[symbol];
+            let occurrences = n_occs_smaller[symbol + 1] - n_occs_smaller[symbol];
+            let expected_samples = if occurrences == 0 {
+                2
+            } else {
+                (occurrences - 1) / SELECT_NUM_SAMPLES + 2
+            };
+            if samples.len() != expected_samples
+                || samples.first().copied() != Some(0)
+                || samples.last().copied() != Some(last_superblock as u32)
+                || samples.windows(2).any(|pair| pair[0] > pair[1])
+                || samples
+                    .iter()
+                    .any(|sample| *sample as usize > last_superblock)
+            {
+                return Err(LayoutError::Inconsistent {
+                    detail: "select samples do not match the level occurrence counts",
+                });
+            }
+        }
+        for symbol in 0..4u8 {
+            let mut previous = 0usize;
+            for (index, superblock) in superblocks.iter().enumerate() {
+                let prefix = superblock.get_superblock_counter(symbol);
+                if prefix < previous || prefix > len {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "superblock rank counters must be monotone and in bounds",
+                    });
+                }
+                if index > 0 && prefix - previous > B_SIZE * BLOCKS_IN_SUPERBLOCK {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "superblock rank delta exceeds superblock capacity",
+                    });
+                }
+                let mut previous_block = 0usize;
+                let symbols_in_superblock = len
+                    .saturating_sub(index * B_SIZE * BLOCKS_IN_SUPERBLOCK)
+                    .min(B_SIZE * BLOCKS_IN_SUPERBLOCK);
+                let valid_blocks = if symbols_in_superblock == B_SIZE * BLOCKS_IN_SUPERBLOCK {
+                    BLOCKS_IN_SUPERBLOCK
+                } else {
+                    (symbols_in_superblock / B_SIZE + 1).min(BLOCKS_IN_SUPERBLOCK)
+                };
+                for block in 0..valid_blocks {
+                    let rank = superblock.get_block_counter(symbol, block);
+                    if rank < previous_block || rank > symbols_in_superblock {
+                        return Err(LayoutError::Inconsistent {
+                            detail: "block rank counters must be monotone and in bounds",
+                        });
+                    }
+                    previous_block = rank;
+                }
+                previous = prefix;
+            }
+        }
 
         Ok(Self {
             data,
@@ -310,9 +386,9 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         if total <= i {
             return None;
         }
-        let (mut pos, rank) = self.select_block(symbol, i + 1);
-        pos += self.select_intra_block(symbol, i - rank + 1, pos);
-        Some(pos)
+        let (mut pos, rank) = self.select_block(symbol, i + 1)?;
+        pos += self.select_intra_block(symbol, i.checked_sub(rank)? + 1, pos)?;
+        (pos < self.len()).then_some(pos)
     }
 
     #[inline(always)]
@@ -401,18 +477,21 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
 
     /// `(block_start_pos, rank_at_block_start)` for the 1-based `i`-th occurrence.
     #[inline]
-    fn select_block(&self, symbol: u8, i: usize) -> (usize, usize) {
+    fn select_block(&self, symbol: u8, i: usize) -> Option<(usize, usize)> {
         let samples = self.select_samples[symbol as usize];
-        debug_assert!(!samples.is_empty(), "select samples always have sentinel");
         let sampled_i = (i - 1) / SELECT_NUM_SAMPLES;
-        let sampled_i = sampled_i.min(samples.len().saturating_sub(2));
-        let mut first_sblock_id = samples[sampled_i] as usize;
-        let last_sblock_id = 1 + samples[sampled_i + 1] as usize;
+        let mut first_sblock_id = *samples.get(sampled_i)? as usize;
+        let last_sblock_id = 1usize.checked_add(*samples.get(sampled_i + 1)? as usize)?;
 
         let step = ((last_sblock_id - first_sblock_id) as f64).sqrt() as usize + 1;
 
         while first_sblock_id < last_sblock_id {
-            if self.superblocks[first_sblock_id].get_superblock_counter(symbol) >= i {
+            if self
+                .superblocks
+                .get(first_sblock_id)?
+                .get_superblock_counter(symbol)
+                >= i
+            {
                 break;
             }
             first_sblock_id += step;
@@ -420,7 +499,12 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         first_sblock_id = first_sblock_id.saturating_sub(step);
 
         while first_sblock_id < last_sblock_id {
-            if self.superblocks[first_sblock_id].get_superblock_counter(symbol) >= i {
+            if self
+                .superblocks
+                .get(first_sblock_id)?
+                .get_superblock_counter(symbol)
+                >= i
+            {
                 break;
             }
             first_sblock_id += 1;
@@ -428,18 +512,18 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         first_sblock_id = first_sblock_id.saturating_sub(1);
 
         let mut position = first_sblock_id * B_SIZE * BLOCKS_IN_SUPERBLOCK;
-        let mut rank = self.superblocks[first_sblock_id].get_superblock_counter(symbol);
+        let superblock = self.superblocks.get(first_sblock_id)?;
+        let mut rank = superblock.get_superblock_counter(symbol);
 
-        let (block_id, block_rank) =
-            self.superblocks[first_sblock_id].block_predecessor(symbol, i - rank);
+        let (block_id, block_rank) = superblock.block_predecessor(symbol, i.checked_sub(rank)?);
         position += block_id * B_SIZE;
         rank += block_rank;
-        (position, rank)
+        Some((position, rank))
     }
 
     /// Offset within the block at `pos` of the 1-based residual occurrence `i`.
     #[inline]
-    fn select_intra_block(&self, symbol: u8, i: usize, pos: usize) -> usize {
+    fn select_intra_block(&self, symbol: u8, i: usize, pos: usize) -> Option<usize> {
         let line_id = pos >> 8;
         let mut rem = i - 1;
 
@@ -447,22 +531,21 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         let n_lines = if B_SIZE == 256 { 1 } else { 2 };
         let mut result = 0usize;
         for j in 0..n_lines {
-            let (word_0, word_1) =
-                unsafe { self.data.get_unchecked(line_id + j).normalize(symbol) };
+            let (word_0, word_1) = self.data.get(line_id + j)?.normalize(symbol);
             let cnt_0 = word_0.count_ones() as usize;
             if cnt_0 > rem {
-                return result + select_in_word_u128(word_0, rem as u64) as usize;
+                return Some(result + select_in_word_u128(word_0, rem as u64) as usize);
             }
             rem -= cnt_0;
             result += 128;
             let cnt_1 = word_1.count_ones() as usize;
             if cnt_1 > rem {
-                return result + select_in_word_u128(word_1, rem as u64) as usize;
+                return Some(result + select_in_word_u128(word_1, rem as u64) as usize);
             }
             rem -= cnt_1;
             result += 128;
         }
-        0
+        None
     }
 }
 
