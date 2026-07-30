@@ -183,6 +183,42 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
                 detail: "position_bits exceeds data capacity",
             });
         }
+        let len = position_bits / 2;
+        let expected_data = len.div_ceil(256);
+        if n_data != expected_data {
+            return Err(LayoutError::Inconsistent {
+                detail: "data-line count does not match logical length",
+            });
+        }
+        let superblock_size = B_SIZE * BLOCKS_IN_SUPERBLOCK;
+        let expected_superblocks = (len + superblock_size) / superblock_size;
+        if n_sb != expected_superblocks {
+            return Err(LayoutError::Inconsistent {
+                detail: "superblock count does not match logical length",
+            });
+        }
+        if n_occs_smaller[0] != 0
+            || n_occs_smaller[4] != len
+            || n_occs_smaller.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            return Err(LayoutError::Inconsistent {
+                detail: "occurrence counters do not match logical length",
+            });
+        }
+        for samples in &select_samples {
+            if samples.len() < 2
+                || samples.windows(2).any(|pair| pair[0] > pair[1])
+                || samples
+                    .iter()
+                    .any(|&sample| sample as usize >= superblocks.len())
+                || samples.last().copied().map(|sample| sample as usize)
+                    != superblocks.len().checked_sub(1)
+            {
+                return Err(LayoutError::Inconsistent {
+                    detail: "invalid select-sample metadata",
+                });
+            }
+        }
 
         Ok(Self {
             data,
@@ -310,8 +346,8 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         if total <= i {
             return None;
         }
-        let (mut pos, rank) = self.select_block(symbol, i + 1);
-        pos += self.select_intra_block(symbol, i - rank + 1, pos);
+        let (mut pos, rank) = self.select_block(symbol, i + 1)?;
+        pos += self.select_intra_block(symbol, i - rank + 1, pos)?;
         Some(pos)
     }
 
@@ -401,45 +437,57 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
 
     /// `(block_start_pos, rank_at_block_start)` for the 1-based `i`-th occurrence.
     #[inline]
-    fn select_block(&self, symbol: u8, i: usize) -> (usize, usize) {
+    fn select_block(&self, symbol: u8, i: usize) -> Option<(usize, usize)> {
         let samples = self.select_samples[symbol as usize];
-        debug_assert!(!samples.is_empty(), "select samples always have sentinel");
         let sampled_i = (i - 1) / SELECT_NUM_SAMPLES;
-        let sampled_i = sampled_i.min(samples.len().saturating_sub(2));
-        let mut first_sblock_id = samples[sampled_i] as usize;
-        let last_sblock_id = 1 + samples[sampled_i + 1] as usize;
+        let first_sample = *samples.get(sampled_i)?;
+        let last_sample = *samples.get(sampled_i + 1)?;
+        let mut first_sblock_id = first_sample as usize;
+        let last_sblock_id = 1usize.checked_add(last_sample as usize)?;
 
-        let step = ((last_sblock_id - first_sblock_id) as f64).sqrt() as usize + 1;
+        let step = ((last_sblock_id.checked_sub(first_sblock_id)?) as f64).sqrt() as usize + 1;
 
         while first_sblock_id < last_sblock_id {
-            if self.superblocks[first_sblock_id].get_superblock_counter(symbol) >= i {
+            if self
+                .superblocks
+                .get(first_sblock_id)?
+                .get_superblock_counter(symbol)
+                >= i
+            {
                 break;
             }
-            first_sblock_id += step;
+            first_sblock_id = first_sblock_id.checked_add(step)?;
         }
         first_sblock_id = first_sblock_id.saturating_sub(step);
 
         while first_sblock_id < last_sblock_id {
-            if self.superblocks[first_sblock_id].get_superblock_counter(symbol) >= i {
+            if self
+                .superblocks
+                .get(first_sblock_id)?
+                .get_superblock_counter(symbol)
+                >= i
+            {
                 break;
             }
             first_sblock_id += 1;
         }
         first_sblock_id = first_sblock_id.saturating_sub(1);
 
-        let mut position = first_sblock_id * B_SIZE * BLOCKS_IN_SUPERBLOCK;
-        let mut rank = self.superblocks[first_sblock_id].get_superblock_counter(symbol);
+        let superblock = self.superblocks.get(first_sblock_id)?;
+        let mut position = first_sblock_id
+            .checked_mul(B_SIZE)?
+            .checked_mul(BLOCKS_IN_SUPERBLOCK)?;
+        let mut rank = superblock.get_superblock_counter(symbol);
 
-        let (block_id, block_rank) =
-            self.superblocks[first_sblock_id].block_predecessor(symbol, i - rank);
-        position += block_id * B_SIZE;
-        rank += block_rank;
-        (position, rank)
+        let (block_id, block_rank) = superblock.block_predecessor(symbol, i.checked_sub(rank)?);
+        position = position.checked_add(block_id.checked_mul(B_SIZE)?)?;
+        rank = rank.checked_add(block_rank)?;
+        Some((position, rank))
     }
 
     /// Offset within the block at `pos` of the 1-based residual occurrence `i`.
     #[inline]
-    fn select_intra_block(&self, symbol: u8, i: usize, pos: usize) -> usize {
+    fn select_intra_block(&self, symbol: u8, i: usize, pos: usize) -> Option<usize> {
         let line_id = pos >> 8;
         let mut rem = i - 1;
 
@@ -447,22 +495,21 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         let n_lines = if B_SIZE == 256 { 1 } else { 2 };
         let mut result = 0usize;
         for j in 0..n_lines {
-            let (word_0, word_1) =
-                unsafe { self.data.get_unchecked(line_id + j).normalize(symbol) };
+            let (word_0, word_1) = self.data.get(line_id + j)?.normalize(symbol);
             let cnt_0 = word_0.count_ones() as usize;
             if cnt_0 > rem {
-                return result + select_in_word_u128(word_0, rem as u64) as usize;
+                return Some(result + select_in_word_u128(word_0, rem as u64) as usize);
             }
             rem -= cnt_0;
             result += 128;
             let cnt_1 = word_1.count_ones() as usize;
             if cnt_1 > rem {
-                return result + select_in_word_u128(word_1, rem as u64) as usize;
+                return Some(result + select_in_word_u128(word_1, rem as u64) as usize);
             }
             rem -= cnt_1;
             result += 128;
         }
-        0
+        None
     }
 }
 
