@@ -93,6 +93,11 @@ where
             let dir = LevelDir::read(&bytes[dir_off..dir_off + LEVEL_DIR_SIZE])?;
             levels.push(RSQVectorView::from_dir(bytes, &dir)?);
         }
+        if levels.iter().any(|level| level.len() != n) {
+            return Err(LayoutError::Inconsistent {
+                detail: "QWT level length does not match tree length",
+            });
+        }
 
         Ok(Self {
             n,
@@ -425,6 +430,7 @@ where
     }
 }
 
+
 impl<'a, T, const B_SIZE: usize> RankUnsigned for QwtView<'a, T, B_SIZE>
 where
     T: WTIndexable,
@@ -617,6 +623,16 @@ where
             let dir = HqwtLevelDir::read(&bytes[dir_off..dir_off + HQWT_LEVEL_DIR_SIZE])?;
             levels.push(RSQVectorView::from_dir(bytes, &dir.plain)?);
             lens.push(dir.level_len as usize);
+        }
+        if lens.first().copied().unwrap_or(0) != n
+            || lens
+                .iter()
+                .zip(&levels)
+                .any(|(&logical_len, level)| logical_len > level.len())
+        {
+            return Err(LayoutError::Inconsistent {
+                detail: "HQWT logical level length exceeds payload",
+            });
         }
 
         Ok(Self {
@@ -934,6 +950,37 @@ mod tests {
     }
 
     #[test]
+    fn qwt_view_rejects_tree_level_length_mismatch() {
+        let original = QWT256::from(vec![1u32, 2, 3, 4, 5]);
+        let mut bytes = qwt256_to_bytes(&original).unwrap();
+        bytes[8..16].copy_from_slice(&6u64.to_le_bytes());
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let err = QwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert_eq!(
+            err,
+            LayoutError::Inconsistent {
+                detail: "QWT level length does not match tree length"
+            }
+        );
+    }
+
+    #[test]
+    fn qwt_view_rejects_missing_select_sentinel() {
+        let original = QWT256::from(vec![1u32, 2, 3, 4, 5]);
+        let mut bytes = qwt256_to_bytes(&original).unwrap();
+        let first_n_sel = HEADER_SIZE + 72;
+        bytes[first_n_sel..first_n_sel + 4].copy_from_slice(&1u32.to_le_bytes());
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let err = QwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert_eq!(
+            err,
+            LayoutError::Inconsistent {
+                detail: "invalid select-sample metadata"
+            }
+        );
+    }
+
+    #[test]
     fn hqwt_view_matches_owned() {
         let data: Vec<u32> = (0..500).map(|x| (x * 7) % 64).collect();
         let original = HQWT256::from(data.clone());
@@ -983,6 +1030,22 @@ mod tests {
         let aligned = AlignedBytes::from_slice(&raw);
         let err = HqwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
         assert_eq!(err, LayoutError::BadMagic);
+    }
+
+    #[test]
+    fn hqwt_view_rejects_level_length_beyond_payload() {
+        let original = HQWT256::from(vec![1u32, 2, 3, 4, 5]);
+        let mut bytes = hqwt256_to_bytes(&original).unwrap();
+        let first_level_len = HEADER_SIZE + LEVEL_DIR_SIZE;
+        bytes[first_level_len..first_level_len + 8].copy_from_slice(&6u64.to_le_bytes());
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let err = HqwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert_eq!(
+            err,
+            LayoutError::Inconsistent {
+                detail: "HQWT logical level length exceeds payload"
+            }
+        );
     }
 
     // ── extract / get_and_rank differential (view ↔ heap) ────────────────
@@ -1111,4 +1174,3 @@ mod tests {
         }
     }
 }
-
