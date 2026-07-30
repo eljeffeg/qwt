@@ -203,6 +203,12 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         let last_superblock = n_sb.checked_sub(1).ok_or(LayoutError::Inconsistent {
             detail: "non-empty level must contain a superblock",
         })?;
+        // Select samples: the builder records the superblock of every
+        // `SELECT_NUM_SAMPLES`-th occurrence (by 0-based occurrence index),
+        // then appends a sentinel equal to the last superblock index.
+        // Empty symbols get a filler sample of 0 plus the sentinel so
+        // `select_block` can always index `samples[k]` / `samples[k+1]`.
+        // Sample 0 is the superblock of the first occurrence (may be > 0).
         for symbol in 0..4 {
             let samples = select_samples[symbol];
             let occurrences = n_occs_smaller[symbol + 1] - n_occs_smaller[symbol];
@@ -212,7 +218,6 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
                 (occurrences - 1) / SELECT_NUM_SAMPLES + 2
             };
             if samples.len() != expected_samples
-                || samples.first().copied() != Some(0)
                 || samples.last().copied() != Some(last_superblock as u32)
                 || samples.windows(2).any(|pair| pair[0] > pair[1])
                 || samples
@@ -223,7 +228,31 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
                     detail: "select samples do not match the level occurrence counts",
                 });
             }
+            // Empty symbols: only the filler+sentinel shape is checked above.
+            // Non-empty: each non-sentinel sample k must be the superblock that
+            // contains occurrence index `k * SELECT_NUM_SAMPLES`.
+            if occurrences == 0 {
+                continue;
+            }
+            let n_non_sentinel = samples.len() - 1;
+            for (k, &sample) in samples.iter().take(n_non_sentinel).enumerate() {
+                let target = k * SELECT_NUM_SAMPLES;
+                let sb = sample as usize;
+                if superblocks[sb].get_superblock_counter(symbol as u8) > target {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "select sample superblock rank exceeds the sampled occurrence",
+                    });
+                }
+                if sb + 1 < n_sb
+                    && superblocks[sb + 1].get_superblock_counter(symbol as u8) <= target
+                {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "select sample superblock is before the sampled occurrence",
+                    });
+                }
+            }
         }
+
         for symbol in 0..4u8 {
             let mut previous = 0usize;
             for (index, superblock) in superblocks.iter().enumerate() {
