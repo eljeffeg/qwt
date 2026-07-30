@@ -968,8 +968,63 @@ mod tests {
         assert!(matches!(error, LayoutError::Inconsistent { .. }));
     }
 
+    /// Multi-superblock image where a rare symbol first appears late.
+    #[test]
+    fn qwt_view_accepts_late_debuting_symbol() {
+        let mut data = vec![1u32; 100_000];
+        data.push(7);
+        let original = QWT256::from(data.clone());
+        let bytes = qwt256_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 256> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+
+        assert_eq!(view.len(), original.len());
+        for i in (0..data.len()).step_by(997) {
+            assert_eq!(view.get(i), original.get(i), "get@{i}");
+        }
+        for &sym in &[1u32, 7] {
+            for i in (0..=data.len()).step_by(4099) {
+                assert_eq!(view.rank(sym, i), original.rank(sym, i), "rank({sym},{i})");
+            }
+            if let Some(cnt) = original.rank(sym, data.len()) {
+                for k in 0..cnt.min(5) {
+                    assert_eq!(
+                        view.select(sym, k),
+                        original.select(sym, k),
+                        "select({sym},{k})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Select sample pointing at the wrong superblock is rejected.
+    #[test]
+    fn qwt_view_rejects_corrupt_select_sample() {
+        let data: Vec<u32> = (0..50_000).map(|x| (x % 4) as u32).collect();
+        let original = QWT256::from(data);
+        let mut bytes = qwt256_to_bytes(&original).unwrap();
+        let n_sel0 =
+            u32::from_le_bytes(bytes[HEADER_SIZE + 72..HEADER_SIZE + 76].try_into().unwrap())
+                as usize;
+        assert!(n_sel0 >= 2);
+        let off_sel0 =
+            u64::from_le_bytes(bytes[HEADER_SIZE + 40..HEADER_SIZE + 48].try_into().unwrap())
+                as usize;
+        let n_sb =
+            u32::from_le_bytes(bytes[HEADER_SIZE + 32..HEADER_SIZE + 36].try_into().unwrap());
+        assert!(n_sb > 1);
+        let last = n_sb - 1;
+        bytes[off_sel0..off_sel0 + 4].copy_from_slice(&last.to_le_bytes());
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let error = QwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
+    }
+
+
     #[test]
     fn hqwt_view_matches_owned() {
+
         let data: Vec<u32> = (0..500).map(|x| (x * 7) % 64).collect();
         let original = HQWT256::from(data.clone());
         let bytes = hqwt256_to_bytes(&original).unwrap();
