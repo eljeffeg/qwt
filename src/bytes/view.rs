@@ -15,6 +15,8 @@ use crate::{AccessUnsigned, RankUnsigned, SelectUnsigned};
 use num_traits::AsPrimitive;
 use std::marker::PhantomData;
 use std::mem::size_of;
+use std::ops::Range;
+
 
 // ── Plain QWT view ──────────────────────────────────────────────────────────
 
@@ -125,9 +127,272 @@ where
     pub fn levels(&self) -> &[RSQVectorView<'a, B_SIZE>] {
         &self.levels
     }
+
+    /// Returns the symbol at position `i` together with `rank(symbol, i + 1)`
+    /// (occurrences of that symbol in `0..=i`) in a single tree descent.
+    ///
+    /// Equivalent to `(get(i), rank(get(i), i + 1))` but shares the wavelet
+    /// path for both queries. Returns `None` if `i` is out of bounds.
+    #[inline(always)]
+    #[must_use]
+    pub fn get_and_rank(&self, i: usize) -> Option<(T, usize)> {
+        if i >= self.n || self.n_levels == 0 {
+            return None;
+        }
+        // SAFETY: bounds checked above
+        Some(unsafe { self.get_and_rank_unchecked(i) })
+    }
+
+    /// Returns the symbol at position `i` together with `rank(symbol, i + 1)`
+    /// in a single tree descent.
+    ///
+    /// # Safety
+    /// Calling this method with an out-of-bounds index is undefined behavior.
+    #[inline(always)]
+    #[must_use]
+    pub unsafe fn get_and_rank_unchecked(&self, i: usize) -> (T, usize) {
+        let mut result = T::zero();
+        let mut cur_i = i;
+        let mut cur_p = 0usize;
+
+        for level in 0..self.n_levels - 1 {
+            let lv = &self.levels[level];
+            let symbol = lv.get_unchecked(cur_i);
+            result = (result << 2) | (symbol as usize).as_();
+            let offset = lv.occs_smaller_unchecked(symbol);
+            cur_p = lv.rank_unchecked(symbol, cur_p) + offset;
+            cur_i = lv.rank_unchecked(symbol, cur_i) + offset;
+        }
+
+        let last = self.n_levels - 1;
+        let lv = &self.levels[last];
+        let symbol = lv.get_unchecked(cur_i);
+        let result = (result << 2) | (symbol as usize).as_();
+        // rank(c, i) on the last level (no occs offset), then +1 → rank(c, i+1)
+        let r_i = lv.rank_unchecked(symbol, cur_i);
+        let r_p = lv.rank_unchecked(symbol, cur_p);
+        let rank_inclusive = r_i - r_p + 1;
+        (result, rank_inclusive)
+    }
+
+    /// Bulk-extract symbols in a contiguous position range as an **ascending
+    /// multiset** (sorted by symbol value, with multiplicity).
+    ///
+    /// This is **not** position order: the output is algebraically equal to
+    /// sorting the multiset `{ get(i) | i ∈ range }`, not to iterating
+    /// `get` over the range in index order.
+    ///
+    /// Implementation walks the wavelet tree level-by-level, partitioning each
+    /// contiguous range into at most four child ranges (one per 2-bit digit)
+    /// via `rank_all` + `occs_smaller`. Singleton ranges short-circuit to a single
+    /// remaining-path descent. Empty / out-of-bounds ranges return an empty
+    /// vector.
+    #[inline]
+    #[must_use]
+    pub fn extract_range(&self, range: Range<usize>) -> Vec<T> {
+        if range.start >= range.end || range.end > self.n || self.n_levels == 0 {
+            return Vec::new();
+        }
+        let n = range.end - range.start;
+        let mut out = vec![T::zero(); n];
+        // SAFETY: range is in-bounds on the top level; child ranges stay valid
+        // by wavelet matrix invariants.
+        unsafe {
+            self.extract_range_sorted_rec(0, range.start, range.end, T::zero(), &mut out);
+        }
+        out
+    }
+
+    /// Bulk-extract **ascending distinct** symbols for a contiguous position
+    /// range (one entry per unique value, sorted).
+    ///
+    /// Same expand-tree as [`Self::extract_range`], but leaf digit runs emit a
+    /// single symbol instead of `count` copies — no intermediate multiset and
+    /// no post-dedup pass. Algebraically equal to sort+dedup of per-row
+    /// [`AccessUnsigned::get`] over the range.
+    ///
+    /// Empty / out-of-bounds ranges return an empty vector.
+    #[inline]
+    #[must_use]
+    pub fn extract_range_distinct(&self, range: Range<usize>) -> Vec<T> {
+        let mut out = Vec::new();
+        self.extract_range_distinct_into(range, &mut out);
+        out
+    }
+
+    /// Like [`Self::extract_range_distinct`], writing into `out` (cleared first).
+    ///
+    /// Prefer this when the caller owns a reusable buffer.
+    #[inline]
+    pub fn extract_range_distinct_into(&self, range: Range<usize>, out: &mut Vec<T>) {
+        out.clear();
+        if range.start >= range.end || range.end > self.n || self.n_levels == 0 {
+            return;
+        }
+        out.reserve(range.end - range.start);
+        // SAFETY: range is in-bounds on the top level.
+        unsafe {
+            self.extract_range_distinct_rec(0, range.start, range.end, T::zero(), out);
+        }
+    }
+
+    /// Finish one remaining position starting at `level` with path `prefix`.
+    ///
+    /// Used when a child range has `count == 1` so we avoid expanding a 4-way
+    /// tree for a singleton.
+    #[inline]
+    unsafe fn extract_singleton_from(&self, mut level: usize, mut pos: usize, mut prefix: T) -> T {
+        while level + 1 < self.n_levels {
+            let lv = &self.levels[level];
+            let dig = lv.get_unchecked(pos);
+            prefix = (prefix << 2) | (dig as usize).as_();
+            let offset = lv.occs_smaller_unchecked(dig);
+            pos = lv.rank_unchecked(dig, pos) + offset;
+            level += 1;
+        }
+        let dig = self.levels[level].get_unchecked(pos);
+        (prefix << 2) | (dig as usize).as_()
+    }
+
+    /// Recursive sorted multiset fill: write ascending symbols into `out`.
+    ///
+    /// # Safety
+    /// `start..end` must be a valid contiguous range at `level` of the wavelet
+    /// matrix; `out.len() == end - start`.
+    unsafe fn extract_range_sorted_rec(
+        &self,
+        level: usize,
+        start: usize,
+        end: usize,
+        prefix: T,
+        out: &mut [T],
+    ) {
+        debug_assert_eq!(out.len(), end - start);
+        if start >= end {
+            return;
+        }
+        // Singleton short-circuit: one position → single descent.
+        if end - start == 1 {
+            out[0] = self.extract_singleton_from(level, start, prefix);
+            return;
+        }
+
+        let lv = &self.levels[level];
+        let last = level + 1 == self.n_levels;
+
+        // Partition [start, end) by 2-bit digit via rank_all at both ends.
+        // SAFETY: start/end valid at this level by caller contract.
+        let ranks_s = lv.rank_all_unchecked(start);
+        let ranks_e = lv.rank_all_unchecked(end);
+        let counts = [
+            ranks_e[0] - ranks_s[0],
+            ranks_e[1] - ranks_s[1],
+            ranks_e[2] - ranks_s[2],
+            ranks_e[3] - ranks_s[3],
+        ];
+
+        if last {
+            // Fill runs of (prefix<<2)|b by digit order — already ascending.
+            let mut off = 0usize;
+            for (b, &cnt) in counts.iter().enumerate() {
+                if cnt == 0 {
+                    continue;
+                }
+                let sym: T = (prefix << 2) | b.as_();
+                out[off..off + cnt].fill(sym);
+                off += cnt;
+            }
+            debug_assert_eq!(off, out.len());
+            return;
+        }
+
+        // Partition out into digit-order child slices (no intermediate Vecs).
+        let mut off = 0usize;
+        for (b, &cnt) in counts.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            // SAFETY: b in 0..4
+            let offset = lv.occs_smaller_unchecked(b as u8);
+            let child_start = offset + ranks_s[b];
+            let child_end = child_start + cnt;
+            let child_prefix: T = (prefix << 2) | b.as_();
+            self.extract_range_sorted_rec(
+                level + 1,
+                child_start,
+                child_end,
+                child_prefix,
+                &mut out[off..off + cnt],
+            );
+            off += cnt;
+        }
+        debug_assert_eq!(off, out.len());
+    }
+
+    /// Recursive ascending-distinct emit into `out`.
+    ///
+    /// # Safety
+    /// `start..end` must be a valid contiguous range at `level`.
+    unsafe fn extract_range_distinct_rec(
+        &self,
+        level: usize,
+        start: usize,
+        end: usize,
+        prefix: T,
+        out: &mut Vec<T>,
+    ) {
+        if start >= end {
+            return;
+        }
+        if end - start == 1 {
+            out.push(self.extract_singleton_from(level, start, prefix));
+            return;
+        }
+
+        let lv = &self.levels[level];
+        let last = level + 1 == self.n_levels;
+
+        // SAFETY: start/end valid at this level by caller contract.
+        let ranks_s = lv.rank_all_unchecked(start);
+        let ranks_e = lv.rank_all_unchecked(end);
+        let counts = [
+            ranks_e[0] - ranks_s[0],
+            ranks_e[1] - ranks_s[1],
+            ranks_e[2] - ranks_s[2],
+            ranks_e[3] - ranks_s[3],
+        ];
+
+        if last {
+            for (b, &cnt) in counts.iter().enumerate() {
+                if cnt != 0 {
+                    let sym: T = (prefix << 2) | b.as_();
+                    out.push(sym);
+                }
+            }
+            return;
+        }
+
+        for (b, &cnt) in counts.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let offset = lv.occs_smaller_unchecked(b as u8);
+            let child_start = offset + ranks_s[b];
+            let child_end = child_start + cnt;
+            let child_prefix: T = (prefix << 2) | b.as_();
+            self.extract_range_distinct_rec(
+                level + 1,
+                child_start,
+                child_end,
+                child_prefix,
+                out,
+            );
+        }
+    }
 }
 
 impl<'a, T, const B_SIZE: usize> AccessUnsigned for QwtView<'a, T, B_SIZE>
+
 where
     T: WTIndexable,
     usize: AsPrimitive<T>,
@@ -719,4 +984,131 @@ mod tests {
         let err = HqwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
         assert_eq!(err, LayoutError::BadMagic);
     }
+
+    // ── extract / get_and_rank differential (view ↔ heap) ────────────────
+
+    #[test]
+    fn qwt_view_extract_matches_owned() {
+        let data: Vec<u32> = (0..500).map(|x| (x * 7) % 64).collect();
+        let original = QWT256::from(data.clone());
+        let bytes = qwt256_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 256> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+        let n = data.len();
+
+        // full range
+        assert_eq!(view.extract_range(0..n), original.extract_range(0..n));
+        assert_eq!(
+            view.extract_range_distinct(0..n),
+            original.extract_range_distinct(0..n)
+        );
+
+        // empty / oob
+        assert!(view.extract_range(0..0).is_empty());
+        assert!(view.extract_range(n..n).is_empty());
+        assert!(view.extract_range(0..n + 1).is_empty());
+        let reversed = std::ops::Range { start: 3, end: 2 };
+        assert!(view.extract_range(reversed).is_empty());
+
+        // subrange sweep
+        for start in (0..=n).step_by(37) {
+            for end in (start..=n).step_by(41) {
+                let got = view.extract_range(start..end);
+                let exp = original.extract_range(start..end);
+                assert_eq!(got, exp, "multiset mismatch for {start}..{end}");
+
+                let got_d = view.extract_range_distinct(start..end);
+                let exp_d = original.extract_range_distinct(start..end);
+                assert_eq!(got_d, exp_d, "distinct mismatch for {start}..{end}");
+
+                // into API
+                let mut buf = vec![99u32; 3];
+                view.extract_range_distinct_into(start..end, &mut buf);
+                assert_eq!(buf, exp_d);
+
+                // also equals sort / sort+dedup of per-row get
+                let mut per_row: Vec<_> = (start..end).map(|i| view.get(i).unwrap()).collect();
+                per_row.sort_unstable();
+                assert_eq!(got, per_row);
+                let mut deduped = per_row.clone();
+                deduped.dedup();
+                assert_eq!(got_d, deduped);
+            }
+        }
+
+        // singleton
+        if n > 0 {
+            assert_eq!(view.extract_range(0..1), original.extract_range(0..1));
+            assert_eq!(
+                view.extract_range_distinct(0..1),
+                original.extract_range_distinct(0..1)
+            );
+        }
+    }
+
+    #[test]
+    fn qwt_view_get_and_rank_matches_owned() {
+        let data: Vec<u32> = (0..300).map(|x| (x * 11) % 128).collect();
+        let original = QWT256::from(data.clone());
+        let bytes = qwt256_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 256> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+
+        assert_eq!(view.get_and_rank(data.len()), None);
+        assert_eq!(original.get_and_rank(data.len()), None);
+
+        for i in 0..data.len() {
+            let v = view.get_and_rank(i).unwrap();
+            let o = original.get_and_rank(i).unwrap();
+            assert_eq!(v, o, "get_and_rank@{i}");
+            // also matches get + rank(get, i+1)
+            let sym = view.get(i).unwrap();
+            assert_eq!(v.0, sym);
+            assert_eq!(v.1, view.rank(sym, i + 1).unwrap());
+        }
+    }
+
+    #[test]
+    fn qwt_view_extract_empty_tree() {
+        let mut empty: Vec<u32> = vec![];
+        let original = QWT256::new(&mut empty);
+        let bytes = qwt256_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 256> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+        assert!(view.extract_range(0..0).is_empty());
+        assert!(view.extract_range_distinct(0..0).is_empty());
+        assert_eq!(view.get_and_rank(0), None);
+    }
+
+    #[test]
+    fn qwt_view_extract_large_alphabet() {
+        let data: Vec<u32> = (0..800).map(|x| (x * 13) % 4000).collect();
+        let original = QWT256::from(data.clone());
+        let bytes = qwt256_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 256> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+        let n = data.len();
+
+        for &(start, end) in &[(0, n), (0, 1), (n / 3, 2 * n / 3), (n - 1, n), (10, 50)] {
+            assert_eq!(
+                view.extract_range(start..end),
+                original.extract_range(start..end),
+                "multiset {start}..{end}"
+            );
+            assert_eq!(
+                view.extract_range_distinct(start..end),
+                original.extract_range_distinct(start..end),
+                "distinct {start}..{end}"
+            );
+        }
+
+        for i in (0..n).step_by(23) {
+            assert_eq!(
+                view.get_and_rank(i),
+                original.get_and_rank(i),
+                "get_and_rank@{i}"
+            );
+        }
+    }
 }
+
