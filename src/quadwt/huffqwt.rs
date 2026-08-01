@@ -12,8 +12,8 @@ use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    utils::stable_partition_of_4_with_codes, AccessUnsigned, OccsRangeUnsigned, QVectorBuilder,
-    RankUnsigned, SelectUnsigned, WTIndexable, WTIterator,
+    utils::stable_partition_of_4_with_codes_into, AccessUnsigned, OccsRangeUnsigned,
+    QVectorBuilder, RankUnsigned, SelectUnsigned, WTIndexable, WTIterator,
 };
 
 use super::{prefetch_support::PrefetchSupport, RSforWT};
@@ -114,6 +114,18 @@ where
     /// assert_eq!(qwt.len(), 8);
     /// ```
     pub fn new(sequence: &mut [T]) -> Self {
+        let mut partitioned = vec![T::zero(); sequence.len()];
+        Self::from_buffers(sequence, &mut partitioned)
+    }
+
+    /// Builds from an owned sequence using one reusable partition buffer.
+    fn from_owned(mut sequence: Vec<T>) -> Self {
+        let mut partitioned = vec![T::zero(); sequence.len()];
+        Self::from_buffers(&mut sequence, &mut partitioned)
+    }
+
+    /// Builds the index by alternating between the input and scratch buffers.
+    fn from_buffers<'a>(mut sequence: &'a mut [T], mut partitioned: &'a mut [T]) -> Self {
         if sequence.is_empty() {
             return Self {
                 n: 0,
@@ -187,6 +199,7 @@ where
 
         for _level in 0..n_levels {
             let mut cur_qv = QVectorBuilder::new();
+            let mut counts = [0usize; 5];
 
             for &s in sequence.iter() {
                 let cur_code = codes
@@ -198,6 +211,12 @@ where
                     let qv_symbol = (cur_code.content >> (cur_code.len - shift)) & 3;
                     cur_qv.push(qv_symbol as u8);
                 }
+                let bucket = if cur_code.len <= shift {
+                    4
+                } else {
+                    ((cur_code.content >> (cur_code.len - shift)) & 3) as usize
+                };
+                counts[bucket] += 1;
             }
 
             let qv = cur_qv.build();
@@ -212,7 +231,14 @@ where
             lens.push(cur_qv_len);
             qvs.push(RS::from(qv));
 
-            stable_partition_of_4_with_codes(sequence, shift as usize, &codes);
+            stable_partition_of_4_with_codes_into(
+                sequence,
+                shift as usize,
+                &codes,
+                counts,
+                partitioned,
+            );
+            std::mem::swap(&mut sequence, &mut partitioned);
             shift += 2;
         }
 
@@ -665,8 +691,8 @@ where
     usize: AsPrimitive<T>,
     RS: RSforWT,
 {
-    fn from(mut v: Vec<T>) -> Self {
-        HuffQWaveletTree::new(&mut v[..])
+    fn from(v: Vec<T>) -> Self {
+        HuffQWaveletTree::from_owned(v)
     }
 }
 
@@ -1041,7 +1067,7 @@ where
     where
         I: IntoIterator<Item = T>,
     {
-        HuffQWaveletTree::new(&mut iter.into_iter().collect::<Vec<T>>())
+        HuffQWaveletTree::from(iter.into_iter().collect::<Vec<T>>())
     }
 }
 
