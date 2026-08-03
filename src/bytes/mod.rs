@@ -13,6 +13,8 @@
 //! Prefetch-augmented trees (`*Pfs`) are rejected in v1
 //! ([`LayoutError::PrefetchNotSupported`]).
 
+mod direct;
+mod direct_huff;
 mod error;
 mod hqwb;
 mod level;
@@ -59,3 +61,8 @@ pub const FLAG_PREFETCH: u8 = 0b0000_0010;
 
 #[cfg(test)]
 mod from_parts_tests;
+pub use direct::{
+    qwt256_u32_output_upper_bound, write_qwt256_u32_direct, DirectQwtBuildBudget,
+    DirectQwtBuildError, DirectQwtBuildStats,
+};
+pub use direct_huff::{hqwt256_u32_output_upper_bound, write_hqwt256_u32_direct};
