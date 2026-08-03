@@ -30,20 +30,20 @@ use std::mem::size_of;
 
 /// One HQWT level directory entry (136 bytes = 128 + level_len).
 #[derive(Clone, Debug)]
-struct LevelDir {
-    off_data: u64,
-    n_datalines: u32,
-    position_bits: u64,
-    off_superblocks: u64,
-    n_superblocks: u32,
-    off_sel: [u64; 4],
-    n_sel: [u32; 4],
-    n_occs_smaller: [u64; 5],
-    level_len: u64,
+pub(super) struct LevelDir {
+    pub(super) off_data: u64,
+    pub(super) n_datalines: u32,
+    pub(super) position_bits: u64,
+    pub(super) off_superblocks: u64,
+    pub(super) n_superblocks: u32,
+    pub(super) off_sel: [u64; 4],
+    pub(super) n_sel: [u32; 4],
+    pub(super) n_occs_smaller: [u64; 5],
+    pub(super) level_len: u64,
 }
 
 impl LevelDir {
-    fn write(&self, out: &mut [u8]) {
+    pub(super) fn write(&self, out: &mut [u8]) {
         debug_assert_eq!(out.len(), HQWT_LEVEL_DIR_SIZE);
         let mut o = 0;
         put_u64(out, &mut o, self.off_data);

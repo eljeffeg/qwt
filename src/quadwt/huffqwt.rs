@@ -9,7 +9,7 @@ use mem_dbg::{MemDbg, MemSize};
 use minimum_redundancy::{BitsPerFragment, Coding};
 use num_traits::AsPrimitive;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Reverse;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::{Bound, Range, RangeBounds};
@@ -35,19 +35,12 @@ pub struct HuffQWaveletTree<T, RS, const WITH_PREFETCH_SUPPORT: bool = false> {
     prefetch_support: Option<Vec<PrefetchSupport>>,
 }
 
-struct LenInfo(usize, u32); // symbol, len
+struct LenInfo(usize, u32, usize); // symbol, len, frequency
 
 #[allow(clippy::identity_op)]
-fn craft_wm_codes(freq: &mut HashMap<usize, u32>, sigma: usize) -> Vec<PrefixCode> {
-    // count size of the alphabet
-    let alph_size = freq.iter().count();
-
-    let mut f = freq
-        .iter()
-        .map(|(&k, &v)| LenInfo(k, v * 2)) // each fragment is 2 bits
-        .collect::<Vec<_>>();
-
-    f.sort_by_key(|x| x.1);
+fn craft_wm_codes(mut lengths: Vec<LenInfo>, sigma: usize) -> Vec<PrefixCode> {
+    let alph_size = lengths.len();
+    lengths.sort_unstable_by_key(|x| (x.1, Reverse(x.2), x.0));
 
     let mut c = vec![0; alph_size * 4];
     let mut assignments = vec![PrefixCode { content: 0, len: 0 }; sigma + 1];
@@ -55,9 +48,7 @@ fn craft_wm_codes(freq: &mut HashMap<usize, u32>, sigma: usize) -> Vec<PrefixCod
     let mut l = 0;
 
     for j in 0..alph_size {
-        // println!("f[{}]: ({}, {})", j, f[j].0, f[j].1);
-
-        while f[j].1 > l {
+        while lengths[j].1 > l {
             for r in j..m {
                 c[(m - j) * 3 + r] = c[r];
                 c[(m - j) * 2 + r] = c[r] | 1 << l;
@@ -75,13 +66,32 @@ fn craft_wm_codes(freq: &mut HashMap<usize, u32>, sigma: usize) -> Vec<PrefixCod
             reversed_code |= ((c[j] >> t) & 3) << (l - t - 2);
         }
 
-        assignments[f[j].0] = PrefixCode {
+        assignments[lengths[j].0] = PrefixCode {
             content: reversed_code,
             len: l,
         };
     }
 
     assignments
+}
+
+pub(crate) fn huffman_codes_from_frequencies(frequencies: &[usize]) -> Vec<PrefixCode> {
+    let sigma = frequencies.len().saturating_sub(1);
+    let mut symbol_frequencies = frequencies
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, frequency)| frequency != 0)
+        .collect::<Vec<_>>();
+    symbol_frequencies.sort_unstable_by_key(|&(symbol, frequency)| (frequency, symbol));
+
+    let (values, mut weights): (Vec<_>, Vec<_>) = symbol_frequencies.into_iter().unzip();
+    let coding = Coding::from_sorted(BitsPerFragment(2), values.into_boxed_slice(), &mut weights);
+    let lengths = coding
+        .codes()
+        .map(|(symbol, code)| LenInfo(*symbol, code.len * 2, frequencies[*symbol]))
+        .collect();
+    craft_wm_codes(lengths, sigma)
 }
 
 impl<T, RS, const WITH_PREFETCH_SUPPORT: bool> HuffQWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>
@@ -125,34 +135,14 @@ where
         }
 
         let sigma = *sequence.iter().max().unwrap();
-        // count symbol frequences
-        let freqs = sequence.iter().fold(HashMap::new(), |mut map, &c| {
-            *map.entry(c.as_()).or_insert(0usize) += 1;
-            map
-        });
-
-        // println!("entropy: {}", Frequencies::entropy(&freqs));
-
-        // println!("freqs: {:?}", &freqs);
-
-        // let tot_occs = sequence.len();
-        // println!("total occurrences: {}", tot_occs);
-
-        let mut lengths =
-            Coding::from_frequencies_cloned(BitsPerFragment(2), &freqs).code_lengths();
-
-        // println!("lengths: {:?}", &lengths);
-
-        // let mut awpl = 0;
-
-        // for (&k, &v) in lengths.iter() {
-        //     // println!("{} {} {}", &k, &v, freqs[&k]);
-        //     awpl += v as usize * 2 * freqs[&k];
-        // }
-
-        // println!("awpl in bits: {}", awpl as f64 / tot_occs as f64);
-
-        let codes = craft_wm_codes(&mut lengths, sigma.as_());
+        let sigma = sigma.as_();
+        let codes = {
+            let mut frequencies = vec![0usize; sigma + 1];
+            for &symbol in sequence.iter() {
+                frequencies[symbol.as_()] += 1;
+            }
+            huffman_codes_from_frequencies(&frequencies)
+        };
 
         // println!("{:?}", codes);
 
