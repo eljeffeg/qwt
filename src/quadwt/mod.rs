@@ -38,12 +38,13 @@
 use crate::utils::{msb, stable_partition_of_4};
 use crate::{
     AccessUnsigned, OccsRangeUnsigned, RankUnsigned, SelectUnsigned, WTIterator, WTSupport,
+    MAX_QUAD_LEVELS,
 };
 use crate::{QVector, QVectorBuilder}; // Traits
 use mem_dbg::{MemDbg, MemSize};
 // Traits bound
 use num_traits::{AsPrimitive, PrimInt, Unsigned};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::marker::PhantomData;
 use std::ops::{Bound, Range, RangeBounds, Shl, Shr};
 
@@ -82,13 +83,44 @@ where
 /// is augmented with extra data to support a deeper level of prefetching.
 /// This extra informationa are needed only for sequences such that data
 /// about superblocks and blocks do not fit in L3 cache.
-#[derive(Default, Clone, PartialEq, Debug, Serialize, MemSize, MemDbg, Deserialize)]
+#[derive(Default, Clone, PartialEq, Debug, Serialize, MemSize, MemDbg)]
 pub struct QWaveletTree<T, RS, const WITH_PREFETCH_SUPPORT: bool = false> {
     n: usize,        // The length of the represented sequence
     n_levels: usize, // The number of levels of the wavelet matrix
     sigma: T, // The largest symbol in the sequence. *NOTE*: It's not +1 because it may overflow
     qvs: Vec<RS>, // A quad vector for each level
     prefetch_support: Option<Vec<PrefetchSupport>>,
+}
+
+#[derive(Deserialize)]
+struct QWaveletTreeSerde<T, RS> {
+    n: usize,
+    n_levels: usize,
+    sigma: T,
+    qvs: Vec<RS>,
+    prefetch_support: Option<Vec<PrefetchSupport>>,
+}
+
+impl<'de, T, RS, const WITH_PREFETCH_SUPPORT: bool> Deserialize<'de>
+    for QWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>
+where
+    T: WTIndexable + Deserialize<'de>,
+    usize: AsPrimitive<T>,
+    RS: RSforWT + Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decoded = QWaveletTreeSerde::<T, RS>::deserialize(deserializer)?;
+        if WITH_PREFETCH_SUPPORT || decoded.prefetch_support.is_some() {
+            return Err(serde::de::Error::custom(
+                "deserializing prefetch-augmented QWT state is not supported",
+            ));
+        }
+        Self::from_parts(decoded.n, decoded.n_levels, decoded.sigma, decoded.qvs)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl<T, RS, const WITH_PREFETCH_SUPPORT: bool> QWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>
@@ -287,17 +319,80 @@ where
         if WITH_PREFETCH_SUPPORT {
             return Err(crate::bytes::LayoutError::PrefetchNotSupported);
         }
+        let max_type_levels = (std::mem::size_of::<T>() * u8::BITS as usize).div_ceil(2);
+        if n_levels > MAX_QUAD_LEVELS || n_levels > max_type_levels {
+            return Err(crate::bytes::LayoutError::Inconsistent {
+                detail: "QWT level count exceeds the supported maximum",
+            });
+        }
         // Empty-tree convention from `new([])`: n_levels == 0 with a single default qv.
         if n == 0 {
-            if n_levels != 0 {
+            if n_levels != 0 || sigma != T::zero() {
                 return Err(crate::bytes::LayoutError::Inconsistent {
-                    detail: "empty tree must have n_levels == 0",
+                    detail: "empty tree must have zero sigma and zero levels",
                 });
             }
-        } else if qvs.len() != n_levels {
+        } else if n_levels == 0 || qvs.len() != n_levels {
             return Err(crate::bytes::LayoutError::Inconsistent {
                 detail: "n_levels disagrees with qvs length",
             });
+        }
+        if n > 0 {
+            let expected_levels = (msb(sigma) + 1).div_ceil(2) as usize;
+            if n_levels != expected_levels {
+                return Err(crate::bytes::LayoutError::Inconsistent {
+                    detail: "n_levels disagrees with sigma",
+                });
+            }
+            for level in &qvs {
+                let level_len = (0..4u8)
+                    .map(|symbol| level.occs(symbol).unwrap_or(usize::MAX))
+                    .try_fold(0usize, usize::checked_add)
+                    .ok_or(crate::bytes::LayoutError::Inconsistent {
+                        detail: "QWT level occurrence counts overflow",
+                    })?;
+                if level_len != n || level.rank(0, n).is_none() {
+                    return Err(crate::bytes::LayoutError::Inconsistent {
+                        detail: "QWT level length disagrees with header length",
+                    });
+                }
+            }
+            let mut actual_sigma = T::zero();
+            for index in 0..n {
+                let mut value = T::zero();
+                let mut current = index;
+                for (level_index, level) in qvs.iter().enumerate() {
+                    let symbol = crate::AccessQuad::get(level, current).ok_or(
+                        crate::bytes::LayoutError::Inconsistent {
+                            detail: "QWT payload transition is out of bounds",
+                        },
+                    )?;
+                    value = (value << 2) | (symbol as usize).as_();
+                    if level_index + 1 < n_levels {
+                        let offset = level.occs_smaller(symbol).ok_or(
+                            crate::bytes::LayoutError::Inconsistent {
+                                detail: "QWT payload contains an invalid symbol",
+                            },
+                        )?;
+                        let rank = crate::RankQuad::rank(level, symbol, current).ok_or(
+                            crate::bytes::LayoutError::Inconsistent {
+                                detail: "QWT payload rank metadata is invalid",
+                            },
+                        )?;
+                        current = offset.checked_add(rank).ok_or(
+                            crate::bytes::LayoutError::Inconsistent {
+                                detail: "QWT payload transition overflows",
+                            },
+                        )?;
+                    }
+                }
+                actual_sigma = actual_sigma.max(value);
+            }
+            if actual_sigma != sigma {
+                return Err(crate::bytes::LayoutError::Inconsistent {
+                    detail: "sigma disagrees with the encoded QWT payload",
+                });
+            }
         }
         Ok(Self {
             n,
@@ -1050,20 +1145,13 @@ where
             let child_start = offset + ranks_s[b];
             let child_end = child_start + cnt;
             let child_prefix: T = (prefix << 2) | b.as_();
-            self.extract_range_distinct_rec(
-                level + 1,
-                child_start,
-                child_end,
-                child_prefix,
-                out,
-            );
+            self.extract_range_distinct_rec(level + 1, child_start, child_end, child_prefix, out);
         }
     }
 }
 
 impl<T, RS, const WITH_PREFETCH_SUPPORT: bool> OccsRangeUnsigned
     for QWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>
-
 where
     T: WTIndexable,
     usize: AsPrimitive<T>,
@@ -1397,6 +1485,9 @@ where
         if i > self.n || symbol > self.sigma {
             return None;
         }
+        if self.n_levels == 0 {
+            return Some(0);
+        }
 
         // SAFETY: Check above guarantees we are not out of bound
         Some(unsafe { self.rank_unchecked(symbol, i) })
@@ -1427,6 +1518,9 @@ where
     /// ```
     #[inline(always)]
     unsafe fn rank_unchecked(&self, symbol: Self::Item, i: usize) -> usize {
+        if self.n_levels == 0 {
+            return 0;
+        }
         let mut shift: i64 = (2 * (self.n_levels - 1)) as i64;
         let mut cur_i = i;
         let mut cur_p = 0;

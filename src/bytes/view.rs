@@ -11,12 +11,12 @@ use super::{
 };
 use crate::quadwt::huffqwt::PrefixCode;
 use crate::quadwt::WTIndexable;
-use crate::{AccessUnsigned, RankUnsigned, SelectUnsigned};
+use crate::utils::msb;
+use crate::{AccessUnsigned, RankQuad, RankUnsigned, SelectUnsigned, MAX_QUAD_LEVELS};
 use num_traits::AsPrimitive;
 use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ops::Range;
-
 
 // ── Plain QWT view ──────────────────────────────────────────────────────────
 
@@ -82,7 +82,22 @@ where
         let n_levels = get_u16(bytes, &mut o) as usize;
         let _ = o;
 
-        let dir_end = HEADER_SIZE + n_levels * LEVEL_DIR_SIZE;
+        let max_type_levels = (size_of::<T>() * u8::BITS as usize).div_ceil(2);
+        if sigma.as_() != sigma_u
+            || n_levels > MAX_QUAD_LEVELS
+            || n_levels > max_type_levels
+            || (n > 0 && n_levels == 0)
+            || (n == 0 && (n_levels != 0 || sigma != T::zero()))
+        {
+            return Err(LayoutError::Inconsistent {
+                detail: "plain QWT level count is invalid",
+            });
+        }
+
+        let dir_end = n_levels
+            .checked_mul(LEVEL_DIR_SIZE)
+            .and_then(|size| HEADER_SIZE.checked_add(size))
+            .ok_or(LayoutError::Truncated)?;
         if bytes.len() < dir_end {
             return Err(LayoutError::Truncated);
         }
@@ -93,14 +108,56 @@ where
             let dir = LevelDir::read(&bytes[dir_off..dir_off + LEVEL_DIR_SIZE])?;
             levels.push(RSQVectorView::from_dir(bytes, &dir)?);
         }
+        if levels.iter().any(|level| level.len() != n) {
+            return Err(LayoutError::Inconsistent {
+                detail: "plain QWT level length disagrees with header length",
+            });
+        }
 
-        Ok(Self {
+        if n > 0 && n_levels != (msb(sigma) + 1).div_ceil(2) as usize {
+            return Err(LayoutError::Inconsistent {
+                detail: "plain QWT level count disagrees with sigma",
+            });
+        }
+
+        let view = Self {
             n,
             n_levels,
             sigma,
             levels,
             _marker: PhantomData,
-        })
+        };
+        if n > 0 {
+            let mut actual_sigma = T::zero();
+            let mut start = 0usize;
+            let mut end = n;
+            for (level_index, level) in view.levels.iter().enumerate() {
+                // SAFETY: the top-level interval is `0..n`; each child
+                // interval is derived from validated ranks and child offsets.
+                let ranks_start = unsafe { level.rank_all_unchecked(start) };
+                let ranks_end = unsafe { level.rank_all_unchecked(end) };
+                let Some(digit) = (0..4)
+                    .rev()
+                    .find(|&digit| ranks_end[digit] > ranks_start[digit])
+                else {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "plain QWT maximum path is empty",
+                    });
+                };
+                actual_sigma = (actual_sigma << 2) | digit.as_();
+                if level_index + 1 < n_levels {
+                    let offset = level.n_occs_smaller()[digit];
+                    start = offset + ranks_start[digit];
+                    end = offset + ranks_end[digit];
+                }
+            }
+            if actual_sigma != sigma {
+                return Err(LayoutError::Inconsistent {
+                    detail: "plain QWT sigma disagrees with encoded payload",
+                });
+            }
+        }
+        Ok(view)
     }
 
     #[inline]
@@ -380,19 +437,12 @@ where
             let child_start = offset + ranks_s[b];
             let child_end = child_start + cnt;
             let child_prefix: T = (prefix << 2) | b.as_();
-            self.extract_range_distinct_rec(
-                level + 1,
-                child_start,
-                child_end,
-                child_prefix,
-                out,
-            );
+            self.extract_range_distinct_rec(level + 1, child_start, child_end, child_prefix, out);
         }
     }
 }
 
 impl<'a, T, const B_SIZE: usize> AccessUnsigned for QwtView<'a, T, B_SIZE>
-
 where
     T: WTIndexable,
     usize: AsPrimitive<T>,
@@ -576,7 +626,16 @@ where
         let decode_n_buckets = get_u16(bytes, &mut o) as usize;
         let _ = o;
 
-        let dir_end = HEADER_SIZE + n_levels * HQWT_LEVEL_DIR_SIZE;
+        if n_levels > MAX_QUAD_LEVELS || (n > 0 && n_levels == 0) {
+            return Err(LayoutError::Inconsistent {
+                detail: "Huffman QWT level count is invalid",
+            });
+        }
+
+        let dir_end = n_levels
+            .checked_mul(HQWT_LEVEL_DIR_SIZE)
+            .and_then(|size| HEADER_SIZE.checked_add(size))
+            .ok_or(LayoutError::Truncated)?;
         if bytes.len() < dir_end {
             return Err(LayoutError::Truncated);
         }
@@ -605,7 +664,13 @@ where
                 p += 4;
                 let sym_u = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap()) as usize;
                 p += 8;
-                bucket.push((content, sym_u.as_()));
+                let symbol: T = sym_u.as_();
+                if symbol.as_() != sym_u {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "Huffman decode symbol does not fit the requested type",
+                    });
+                }
+                bucket.push((content, symbol));
             }
             codes_decode.push(bucket);
         }
@@ -617,6 +682,180 @@ where
             let dir = HqwtLevelDir::read(&bytes[dir_off..dir_off + HQWT_LEVEL_DIR_SIZE])?;
             levels.push(RSQVectorView::from_dir(bytes, &dir.plain)?);
             lens.push(dir.level_len as usize);
+        }
+
+        if n > 0 && lens.first().copied() != Some(n) {
+            return Err(LayoutError::Inconsistent {
+                detail: "first Huffman QWT level length disagrees with header length",
+            });
+        }
+        if levels
+            .iter()
+            .zip(&lens)
+            .any(|(level, &len)| level.len() != len)
+        {
+            return Err(LayoutError::Inconsistent {
+                detail: "Huffman QWT level payload length disagrees with directory",
+            });
+        }
+        let max_code_bits = n_levels.saturating_mul(2);
+        for (symbol, code) in codes_encode.iter().enumerate() {
+            if code.len == 0 {
+                continue;
+            }
+            let code_len = code.len as usize;
+            if !code_len.is_multiple_of(2)
+                || code_len > max_code_bits
+                || code_len > u32::BITS as usize
+            {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman encode code length is invalid",
+                });
+            }
+            if code_len < u32::BITS as usize && code.content >= (1u32 << code_len) {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman encode code has bits outside its declared length",
+                });
+            }
+            let Some(bucket) = codes_decode.get(code_len) else {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman decode bucket is missing",
+                });
+            };
+            let Ok(index) = bucket.binary_search_by_key(&code.content, |(content, _)| *content)
+            else {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman encode code is absent from its decode bucket",
+                });
+            };
+            if bucket[index].1.as_() != symbol {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman encode/decode symbol mapping disagrees",
+                });
+            }
+        }
+        for (code_len, bucket) in codes_decode.iter().enumerate() {
+            if bucket.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman decode bucket must be strictly sorted",
+                });
+            }
+            for &(content, symbol) in bucket {
+                let symbol_index: usize = symbol.as_();
+                let Some(code) = codes_encode.get(symbol_index) else {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "Huffman decode symbol is outside the encode table",
+                    });
+                };
+                if code.len as usize != code_len || code.content != content {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "Huffman decode entry disagrees with its encode code",
+                    });
+                }
+            }
+        }
+
+        // Validate every code's rank path at the full sequence boundary. All
+        // smaller query positions remain within the same checked intervals.
+        for code in codes_encode.iter().filter(|code| code.len != 0) {
+            let mut start = 0usize;
+            let mut end = n;
+            let mut shift = code.len as usize;
+            let mut level = 0usize;
+            while shift > 0 {
+                shift -= 2;
+                let Some(view) = levels.get(level) else {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "Huffman code descends beyond available levels",
+                    });
+                };
+                if end > view.len() {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "Huffman rank path exceeds a level length",
+                    });
+                }
+                let symbol = ((code.content >> shift) & 3) as u8;
+                let offsets = view.n_occs_smaller();
+                start = view.rank(symbol, start).ok_or(LayoutError::Inconsistent {
+                    detail: "Huffman rank path start is invalid",
+                })? + offsets[symbol as usize];
+                end = view.rank(symbol, end).ok_or(LayoutError::Inconsistent {
+                    detail: "Huffman rank path end is invalid",
+                })? + offsets[symbol as usize];
+                level += 1;
+            }
+        }
+
+        // Validate all populated access paths as contiguous wavelet ranges.
+        // This proves the same property as decoding every row, but work scales
+        // with the Huffman prefix tree rather than the number of stored rows.
+        let mut pending = if n == 0 {
+            Vec::new()
+        } else {
+            vec![(0usize, 0usize, n, 0u32, 0usize)]
+        };
+        while let Some((level_index, start, end, content, code_len)) = pending.pop() {
+            let Some(level) = levels.get(level_index) else {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman access path exceeds available levels",
+                });
+            };
+            if end > lens[level_index] {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman access path exceeds a level",
+                });
+            }
+            // SAFETY: `start..end` was checked against this level's length;
+            // child ranges come from validated rank metadata and offsets.
+            let ranks_start = unsafe { level.rank_all_unchecked(start) };
+            let ranks_end = unsafe { level.rank_all_unchecked(end) };
+            for digit in 0..4usize {
+                if ranks_start[digit] == ranks_end[digit] {
+                    continue;
+                }
+                let child_content = (content << 2) | digit as u32;
+                let child_code_len = code_len + 2;
+                let has_decode = codes_decode.get(child_code_len).is_some_and(|bucket| {
+                    bucket
+                        .binary_search_by_key(&child_content, |(candidate, _)| *candidate)
+                        .is_ok()
+                });
+                let Some(next_level_len) = lens.get(level_index + 1).copied() else {
+                    if !has_decode {
+                        return Err(LayoutError::Inconsistent {
+                            detail: "Huffman access path has no decode entry",
+                        });
+                    }
+                    continue;
+                };
+                let offset = level.n_occs_smaller()[digit];
+                let child_start = offset + ranks_start[digit];
+                let child_end = offset + ranks_end[digit];
+                if child_end <= next_level_len {
+                    if has_decode {
+                        return Err(LayoutError::Inconsistent {
+                            detail: "Huffman decode entry has a populated descendant",
+                        });
+                    }
+                    pending.push((
+                        level_index + 1,
+                        child_start,
+                        child_end,
+                        child_content,
+                        child_code_len,
+                    ));
+                } else if child_start >= next_level_len {
+                    if !has_decode {
+                        return Err(LayoutError::Inconsistent {
+                            detail: "Huffman access path has no decode entry",
+                        });
+                    }
+                } else {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "Huffman prefix is split across terminal and continuing rows",
+                    });
+                }
+            }
         }
 
         Ok(Self {
@@ -915,6 +1154,16 @@ mod tests {
     }
 
     #[test]
+    fn qwt_view_rejects_sigma_that_disagrees_with_payload() {
+        let original = QWT256::from(vec![1u32, 2, 3]);
+        let mut bytes = qwt256_to_bytes(&original).unwrap();
+        bytes[16..24].copy_from_slice(&2u64.to_le_bytes());
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let error = QwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
+    }
+
+    #[test]
     fn qwt_view_rejects_unaligned_base() {
         // Build a blob, then force the slice start to be 1-mod-64 so cast fails
         // when there is at least one level with POD payload.
@@ -968,6 +1217,28 @@ mod tests {
         assert!(matches!(error, LayoutError::Inconsistent { .. }));
     }
 
+    #[test]
+    fn qwt_view_rejects_in_range_but_false_rank_metadata() {
+        let original = QWT256::from(vec![0u32; 5_000]);
+        let mut bytes = qwt256_to_bytes(&original).unwrap();
+        let sb_field = HEADER_SIZE + 24;
+        let sb_offset =
+            u64::from_le_bytes(bytes[sb_field..sb_field + 8].try_into().unwrap()) as usize;
+        let second_counter = sb_offset + std::mem::size_of::<crate::SuperblockPlain>();
+        let mut packed = u128::from_le_bytes(
+            bytes[second_counter..second_counter + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(packed >> 84 > 0);
+        packed -= 1u128 << 84;
+        bytes[second_counter..second_counter + 16].copy_from_slice(&packed.to_le_bytes());
+
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let error = QwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
+    }
+
     /// Multi-superblock image where a rare symbol first appears late.
     #[test]
     fn qwt_view_accepts_late_debuting_symbol() {
@@ -1004,15 +1275,22 @@ mod tests {
         let data: Vec<u32> = (0..50_000).map(|x| (x % 4) as u32).collect();
         let original = QWT256::from(data);
         let mut bytes = qwt256_to_bytes(&original).unwrap();
-        let n_sel0 =
-            u32::from_le_bytes(bytes[HEADER_SIZE + 72..HEADER_SIZE + 76].try_into().unwrap())
-                as usize;
+        let n_sel0 = u32::from_le_bytes(
+            bytes[HEADER_SIZE + 72..HEADER_SIZE + 76]
+                .try_into()
+                .unwrap(),
+        ) as usize;
         assert!(n_sel0 >= 2);
-        let off_sel0 =
-            u64::from_le_bytes(bytes[HEADER_SIZE + 40..HEADER_SIZE + 48].try_into().unwrap())
-                as usize;
-        let n_sb =
-            u32::from_le_bytes(bytes[HEADER_SIZE + 32..HEADER_SIZE + 36].try_into().unwrap());
+        let off_sel0 = u64::from_le_bytes(
+            bytes[HEADER_SIZE + 40..HEADER_SIZE + 48]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let n_sb = u32::from_le_bytes(
+            bytes[HEADER_SIZE + 32..HEADER_SIZE + 36]
+                .try_into()
+                .unwrap(),
+        );
         assert!(n_sb > 1);
         let last = n_sb - 1;
         bytes[off_sel0..off_sel0 + 4].copy_from_slice(&last.to_le_bytes());
@@ -1021,10 +1299,8 @@ mod tests {
         assert!(matches!(error, LayoutError::Inconsistent { .. }));
     }
 
-
     #[test]
     fn hqwt_view_matches_owned() {
-
         let data: Vec<u32> = (0..500).map(|x| (x * 7) % 64).collect();
         let original = HQWT256::from(data.clone());
         let bytes = hqwt256_to_bytes(&original).unwrap();
@@ -1051,6 +1327,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hqwt_view_rejects_code_longer_than_available_levels() {
+        let original = HQWT256::from(vec![0u32, 1, 0, 1, 0, 1]);
+        let mut bytes = hqwt256_to_bytes(&original).unwrap();
+        let n_levels = u16::from_le_bytes(bytes[16..18].try_into().unwrap()) as usize;
+        let encode_len = u16::from_le_bytes(bytes[18..20].try_into().unwrap()) as usize;
+        let encode_offset = align_up(HEADER_SIZE + n_levels * HQWT_LEVEL_DIR_SIZE, 8);
+        let mut changed = false;
+        for index in 0..encode_len {
+            let len_offset = encode_offset + index * 8 + 4;
+            let len = u32::from_le_bytes(bytes[len_offset..len_offset + 4].try_into().unwrap());
+            if len != 0 {
+                bytes[len_offset..len_offset + 4].copy_from_slice(&34u32.to_le_bytes());
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed);
+
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let error = HqwtView::<u32, 256>::from_bytes(aligned.as_slice()).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
     }
 
     #[test]
@@ -1200,5 +1500,4 @@ mod tests {
             );
         }
     }
-
 }
