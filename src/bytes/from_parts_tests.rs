@@ -3,7 +3,8 @@
 use crate::qvector::rs_qvector::{RSQVector256, RSSupportPlain};
 use crate::qvector::{DataLine, QVector};
 use crate::{
-    AccessQuad, AccessUnsigned, RankUnsigned, SelectUnsigned, SuperblockPlain, HQWT256, QWT256,
+    AccessQuad, AccessUnsigned, PrefixCode, RankUnsigned, SelectUnsigned, SuperblockPlain, HQWT256,
+    QWT256,
 };
 
 #[test]
@@ -33,6 +34,25 @@ fn rsqvector_from_parts_eq() {
     let rs_rebuilt = RSSupportPlain::<256>::from_parts(superblocks, select_samples);
     let rebuilt = RSQVector256::from_parts(qv, rs_rebuilt, original.n_occs_smaller());
     assert_eq!(original, rebuilt);
+}
+
+fn clone_hqwt_levels(original: &HQWT256<u32>) -> Vec<RSQVector256> {
+    original
+        .levels()
+        .iter()
+        .map(|rs| {
+            let qv = QVector::from_raw_parts(
+                rs.qvector().data_lines().to_vec().into_boxed_slice(),
+                rs.qvector().position_bits(),
+            );
+            let support = rs.rs_support();
+            let superblocks = support.superblocks().to_vec().into_boxed_slice();
+            let select_samples =
+                std::array::from_fn(|s| support.select_samples(s).to_vec().into_boxed_slice());
+            let rs_support = RSSupportPlain::<256>::from_parts(superblocks, select_samples);
+            RSQVector256::from_parts(qv, rs_support, rs.n_occs_smaller())
+        })
+        .collect()
 }
 
 #[test]
@@ -91,6 +111,52 @@ fn qwt_from_parts_eq_queries() {
 }
 
 #[test]
+fn hqwt_from_parts_rejects_terminal_prefix_with_populated_descendants() {
+    let data: Vec<u32> = (0..800)
+        .map(|x| if x % 10 == 0 { 0 } else { (x % 40) + 1 })
+        .collect();
+    let original = HQWT256::from(data);
+    let mut codes_encode = original.codes_encode().to_vec();
+    let mut codes_decode = original.codes_decode().to_vec();
+    let long_code = codes_encode
+        .iter()
+        .find(|code| code.len >= 4)
+        .expect("control tree must contain a multi-level code");
+    let prefix = PrefixCode {
+        content: long_code.content >> 2,
+        len: long_code.len - 2,
+    };
+    let synthetic_symbol = codes_encode.len() as u32;
+    codes_encode.push(prefix.clone());
+    let bucket = &mut codes_decode[prefix.len as usize];
+    assert!(
+        bucket
+            .binary_search_by_key(&prefix.content, |(content, _)| *content)
+            .is_err(),
+        "a valid Huffman table must not already terminate at this prefix"
+    );
+    bucket.push((prefix.content, synthetic_symbol));
+    bucket.sort_unstable();
+
+    let error = HQWT256::from_parts(
+        original.len(),
+        original.n_levels(),
+        codes_encode,
+        codes_decode,
+        clone_hqwt_levels(&original),
+        original.level_lens().to_vec(),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::bytes::LayoutError::Inconsistent {
+            detail: "Huffman decode entry has a populated descendant"
+        }
+    ));
+}
+
+#[test]
 fn hqwt_from_parts_eq_queries() {
     let data: Vec<u32> = (0..800)
         .map(|x| {
@@ -104,22 +170,7 @@ fn hqwt_from_parts_eq_queries() {
         .collect();
     let original = HQWT256::from(data.clone());
 
-    let levels: Vec<_> = original
-        .levels()
-        .iter()
-        .map(|rs| {
-            let qv = QVector::from_raw_parts(
-                rs.qvector().data_lines().to_vec().into_boxed_slice(),
-                rs.qvector().position_bits(),
-            );
-            let support = rs.rs_support();
-            let superblocks = support.superblocks().to_vec().into_boxed_slice();
-            let select_samples =
-                std::array::from_fn(|s| support.select_samples(s).to_vec().into_boxed_slice());
-            let rs_support = RSSupportPlain::<256>::from_parts(superblocks, select_samples);
-            RSQVector256::from_parts(qv, rs_support, rs.n_occs_smaller())
-        })
-        .collect();
+    let levels = clone_hqwt_levels(&original);
 
     let rebuilt = HQWT256::from_parts(
         original.len(),

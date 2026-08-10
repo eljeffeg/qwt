@@ -285,6 +285,16 @@ fn test_serialize() {
     assert_eq!(des_qwt, qwt);
 }
 
+#[test]
+fn empty_tree_rank_is_zero() {
+    let qwt = QWaveletTree::<u8, RSQVector512>::default();
+    assert_eq!(qwt.rank(0, 0), Some(0));
+    assert_eq!(qwt.rank(0, 1), None);
+    assert_eq!(qwt.rank(1, 0), None);
+    // SAFETY: symbol 0 and position 0 are valid for the empty tree.
+    assert_eq!(unsafe { qwt.rank_unchecked(0, 0) }, 0);
+}
+
 // ── range_next_value ─────────────────────────────────────────────────────
 
 fn rnv_scan_oracle(seq: &[u8], range: std::ops::Range<usize>, target: u8) -> Option<u8> {
@@ -636,4 +646,3 @@ fn test_extract_range_empty_tree() {
     assert!(qwt.extract_range_distinct(0..0).is_empty());
     assert_eq!(qwt.get_and_rank(0), None);
 }
-

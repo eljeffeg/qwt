@@ -410,8 +410,16 @@ where
     let encode_len = get_u16(bytes, &mut o) as usize;
     let decode_n_buckets = get_u16(bytes, &mut o) as usize;
     let _ = o;
+    if n_levels > crate::MAX_QUAD_LEVELS || (n > 0 && n_levels == 0) {
+        return Err(LayoutError::Inconsistent {
+            detail: "Huffman QWT level count is invalid",
+        });
+    }
 
-    let dir_end = HEADER_SIZE + n_levels * HQWT_LEVEL_DIR_SIZE;
+    let dir_end = n_levels
+        .checked_mul(HQWT_LEVEL_DIR_SIZE)
+        .and_then(|size| HEADER_SIZE.checked_add(size))
+        .ok_or(LayoutError::Truncated)?;
     if bytes.len() < dir_end {
         return Err(LayoutError::Truncated);
     }
@@ -445,6 +453,11 @@ where
             let sym_u = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap()) as usize;
             p += 8;
             let sym: T = sym_u.as_();
+            if sym.as_() != sym_u {
+                return Err(LayoutError::Inconsistent {
+                    detail: "Huffman decode symbol does not fit the requested type",
+                });
+            }
             bucket.push((content, sym));
         }
         debug_assert_eq!(need, n_entries * 12);
@@ -464,8 +477,18 @@ where
         let data_off = dir.off_data as usize;
         let n_datalines = dir.n_datalines as usize;
         let _ = checked_region(data_off, n_datalines, size_of::<DataLine>(), bytes.len())?;
-        let lines = copy_pod_slice::<DataLine>(&bytes[data_off..], n_datalines)?;
-        let qv = QVector::from_raw_parts(lines, dir.position_bits as usize);
+        // SAFETY: DataLine is repr(C), contains only integers, and accepts every bit pattern.
+        let lines = unsafe { copy_pod_slice::<DataLine>(&bytes[data_off..], n_datalines)? };
+        let position_bits =
+            usize::try_from(dir.position_bits).map_err(|_| LayoutError::Inconsistent {
+                detail: "position_bits exceeds usize",
+            })?;
+        if !position_bits.is_multiple_of(2) || position_bits > n_datalines.saturating_mul(512) {
+            return Err(LayoutError::Inconsistent {
+                detail: "position_bits is invalid for the data payload",
+            });
+        }
+        let qv = QVector::from_raw_parts(lines, position_bits);
 
         if !(dir.off_superblocks as usize).is_multiple_of(64) {
             return Err(LayoutError::Misaligned);
@@ -478,24 +501,14 @@ where
             size_of::<SuperblockPlain>(),
             bytes.len(),
         )?;
-        let superblocks = copy_pod_slice::<SuperblockPlain>(&bytes[sb_off..], n_superblocks)?;
 
-        let mut select_samples: [Box<[u32]>; 4] = Default::default();
-        for (s, sample_slot) in select_samples.iter_mut().enumerate() {
+        for s in 0..4 {
             let n_sel = dir.n_sel[s] as usize;
             let off = dir.off_sel[s] as usize;
             let _ = checked_region(off, n_sel, size_of::<u32>(), bytes.len())?;
-            let mut v = Vec::with_capacity(n_sel);
-            for i in 0..n_sel {
-                let b = off + i * 4;
-                v.push(u32::from_le_bytes(bytes[b..b + 4].try_into().unwrap()));
-            }
-            *sample_slot = v.into_boxed_slice();
         }
 
-        let rs = RSSupportPlain::<B>::from_parts(superblocks, select_samples);
-        let n_occs: [usize; 5] = std::array::from_fn(|i| dir.n_occs_smaller[i] as usize);
-        qvs.push(RSQVector::from_parts(qv, rs, n_occs));
+        qvs.push(RSQVector::<RSSupportPlain<B>>::from(qv));
         lens.push(dir.level_len as usize);
     }
 

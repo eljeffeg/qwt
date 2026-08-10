@@ -145,7 +145,8 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         {
             return Err(LayoutError::Truncated);
         }
-        let data = cast_slice::<DataLine>(&bytes[data_off..data_off + data_bytes])?;
+        // SAFETY: DataLine is repr(C), contains only integers, and accepts every bit pattern.
+        let data = unsafe { cast_slice::<DataLine>(&bytes[data_off..data_off + data_bytes])? };
 
         let sb_off = dir.off_superblocks as usize;
         let n_sb = dir.n_superblocks as usize;
@@ -155,7 +156,9 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         if sb_off.checked_add(sb_bytes).ok_or(LayoutError::Truncated)? > bytes.len() {
             return Err(LayoutError::Truncated);
         }
-        let superblocks = cast_slice::<SuperblockPlain>(&bytes[sb_off..sb_off + sb_bytes])?;
+        // SAFETY: SuperblockPlain is repr(C), contains only integers, and accepts every bit pattern.
+        let superblocks =
+            unsafe { cast_slice::<SuperblockPlain>(&bytes[sb_off..sb_off + sb_bytes])? };
 
         let mut select_samples: [&'a [u32]; 4] = [&[]; 4];
         for (s, sample_slot) in select_samples.iter_mut().enumerate() {
@@ -168,7 +171,8 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
                 return Err(LayoutError::Truncated);
             }
             // u32 LE samples: 4-byte aligned offsets in a 64-aligned base → cast ok.
-            *sample_slot = cast_slice::<u32>(&bytes[off..off + need])?;
+            // SAFETY: every u32 bit pattern is valid.
+            *sample_slot = unsafe { cast_slice::<u32>(&bytes[off..off + need])? };
         }
 
         let n_occs_smaller: [usize; 5] = std::array::from_fn(|i| dir.n_occs_smaller[i] as usize);
@@ -203,6 +207,102 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         let last_superblock = n_sb.checked_sub(1).ok_or(LayoutError::Inconsistent {
             detail: "non-empty level must contain a superblock",
         })?;
+
+        // Recompute every persisted rank counter from the encoded symbols.
+        // Monotonic/in-range metadata alone is insufficient because safe tree
+        // traversal feeds these counters into unchecked accesses on the next
+        // level.
+        let superblock_size = B_SIZE * BLOCKS_IN_SUPERBLOCK;
+        let mut totals = [0usize; 4];
+        let mut superblock_base = [0usize; 4];
+        let mut block_start = 0usize;
+        loop {
+            if block_start.is_multiple_of(superblock_size) {
+                let superblock_index = block_start / superblock_size;
+                let Some(superblock) = superblocks.get(superblock_index) else {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "missing superblock at a sequence boundary",
+                    });
+                };
+                for symbol in 0..4u8 {
+                    if superblock.get_superblock_counter(symbol) != totals[symbol as usize] {
+                        return Err(LayoutError::Inconsistent {
+                            detail: "superblock rank counter disagrees with encoded symbols",
+                        });
+                    }
+                }
+                superblock_base = totals;
+            }
+            if block_start.is_multiple_of(B_SIZE) {
+                let superblock_index = block_start / superblock_size;
+                let block_index = (block_start / B_SIZE) % BLOCKS_IN_SUPERBLOCK;
+                let Some(superblock) = superblocks.get(superblock_index) else {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "missing superblock for block counter",
+                    });
+                };
+                for symbol in 0..4u8 {
+                    if superblock.get_block_counter(symbol, block_index)
+                        != totals[symbol as usize] - superblock_base[symbol as usize]
+                    {
+                        return Err(LayoutError::Inconsistent {
+                            detail: "block rank counter disagrees with encoded symbols",
+                        });
+                    }
+                }
+            }
+            if block_start == len {
+                break;
+            }
+
+            let block_end = block_start.saturating_add(B_SIZE).min(len);
+            let mut position = block_start;
+            while position < block_end {
+                let Some(line) = data.get(position >> 8) else {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "level data is shorter than its position cursor",
+                    });
+                };
+                let line_start = position & 255;
+                let line_end = block_end.min((position | 255).saturating_add(1));
+                let line_len = line_end - position;
+                // SAFETY: `line_start + line_len <= 256` by construction.
+                let end_ranks = unsafe { line.rank_all_unchecked(line_start + line_len) };
+                let start_ranks = if line_start == 0 {
+                    [0; 4]
+                } else {
+                    // SAFETY: `line_start < 256` by construction.
+                    unsafe { line.rank_all_unchecked(line_start) }
+                };
+                for symbol in 0..4 {
+                    totals[symbol] += end_ranks[symbol] - start_ranks[symbol];
+                }
+                position = line_end;
+            }
+            block_start = block_end;
+        }
+        let current_superblock = len / superblock_size;
+        let sentinel_block = (len / B_SIZE) % BLOCKS_IN_SUPERBLOCK + 1;
+        if sentinel_block < BLOCKS_IN_SUPERBLOCK {
+            let superblock = &superblocks[current_superblock];
+            for symbol in 0..4u8 {
+                if superblock.get_block_counter(symbol, sentinel_block)
+                    != totals[symbol as usize] - superblock_base[symbol as usize]
+                {
+                    return Err(LayoutError::Inconsistent {
+                        detail: "sentinel block counter disagrees with encoded symbols",
+                    });
+                }
+            }
+        }
+        for symbol in 0..4 {
+            if n_occs_smaller[symbol + 1] - n_occs_smaller[symbol] != totals[symbol] {
+                return Err(LayoutError::Inconsistent {
+                    detail: "child offsets disagree with encoded symbol counts",
+                });
+            }
+        }
+
         // Select samples: the builder records the superblock of every
         // `SELECT_NUM_SAMPLES`-th occurrence (by 0-based occurrence index),
         // then appends a sentinel equal to the last superblock index.
