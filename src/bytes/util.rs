@@ -51,12 +51,14 @@ pub fn checked_region(
 /// - [`LayoutError::Misaligned`] if `bytes.as_ptr()` is not aligned for `T`
 /// - [`LayoutError::Truncated`] if `bytes.len()` is not a multiple of `size_of::<T>()`
 ///
-/// # Safety considerations
-/// `T` must be a plain-old-data type with no padding that would make an
-/// arbitrary bit pattern invalid (e.g. `DataLine`, `SuperblockPlain`, `u32`).
-/// Callers must uphold that invariant; this helper only checks alignment and length.
+/// # Safety
+///
+/// `T` must be a plain-old-data type for which every bit pattern is valid and
+/// whose initialized representation may be read from the complete byte slice
+/// (e.g. `DataLine`, `SuperblockPlain`, or `u32`). This helper checks only
+/// alignment and length.
 #[inline]
-pub fn cast_slice<T>(bytes: &[u8]) -> Result<&[T], LayoutError> {
+pub unsafe fn cast_slice<T>(bytes: &[u8]) -> Result<&[T], LayoutError> {
     if bytes.is_empty() {
         return Ok(&[]);
     }
@@ -74,9 +76,14 @@ pub fn cast_slice<T>(bytes: &[u8]) -> Result<&[T], LayoutError> {
 }
 
 /// Mutable variant of [`cast_slice`].
+///
+/// # Safety
+///
+/// The requirements of [`cast_slice`] apply. In addition, every byte of each
+/// `T` value must be initialized before the returned slice is read.
 #[inline]
 #[allow(dead_code)] // reserved for in-place writers
-pub fn cast_slice_mut<T>(bytes: &mut [u8]) -> Result<&mut [T], LayoutError> {
+pub unsafe fn cast_slice_mut<T>(bytes: &mut [u8]) -> Result<&mut [T], LayoutError> {
     if bytes.is_empty() {
         return Ok(&mut []);
     }
@@ -103,8 +110,15 @@ pub fn cast_slice_mut<T>(bytes: &mut [u8]) -> Result<&mut [T], LayoutError> {
 ///
 /// # Errors
 /// - [`LayoutError::Truncated`] if `bytes.len() < n * size_of::<T>()`
+///
+/// # Safety
+///
+/// `T` must be a plain-old-data type for which every bit pattern is valid.
 #[inline]
-pub fn copy_pod_slice<T: Copy + Default>(bytes: &[u8], n: usize) -> Result<Box<[T]>, LayoutError> {
+pub unsafe fn copy_pod_slice<T: Copy + Default>(
+    bytes: &[u8],
+    n: usize,
+) -> Result<Box<[T]>, LayoutError> {
     let need = n
         .checked_mul(size_of::<T>())
         .ok_or(LayoutError::Truncated)?;
@@ -127,9 +141,14 @@ pub fn copy_pod_slice<T: Copy + Default>(bytes: &[u8], n: usize) -> Result<Box<[
 ///
 /// Uses `std::slice::from_raw_parts` on the typed slice so the in-memory
 /// `#[repr(C)]` layout is preserved byte-for-byte.
+///
+/// # Safety
+///
+/// `T` must have a fully initialized plain-old-data representation with no
+/// uninitialized padding bytes.
 #[inline]
 #[allow(dead_code)] // reserved for bulk POD writers
-pub fn write_slice<T>(out: &mut Vec<u8>, data: &[T]) {
+pub unsafe fn write_slice<T>(out: &mut Vec<u8>, data: &[T]) {
     if data.is_empty() {
         return;
     }
@@ -154,7 +173,8 @@ mod tests {
 
     #[test]
     fn cast_empty() {
-        let empty: &[DataLine] = cast_slice::<DataLine>(&[]).unwrap();
+        // SAFETY: DataLine is POD and every bit pattern is valid.
+        let empty: &[DataLine] = unsafe { cast_slice::<DataLine>(&[]) }.unwrap();
         assert!(empty.is_empty());
     }
 
@@ -164,7 +184,8 @@ mod tests {
         let mut buf = vec![0u8; 128];
         let start = align_up(buf.as_ptr() as usize, 64) - buf.as_ptr() as usize;
         let slice = &buf[start..start + 64];
-        let lines: &[DataLine] = cast_slice(slice).unwrap();
+        // SAFETY: DataLine is POD and the test bytes are initialized.
+        let lines: &[DataLine] = unsafe { cast_slice(slice) }.unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].words, [0; 4]);
         // silence unused mut
@@ -175,6 +196,7 @@ mod tests {
     fn cast_rejects_short() {
         let buf = [0u8; 32]; // half a DataLine
                              // May also fail alignment; either error is fine.
-        assert!(cast_slice::<DataLine>(&buf).is_err());
+                             // SAFETY: DataLine is POD; this call is expected to reject alignment.
+        assert!(unsafe { cast_slice::<DataLine>(&buf) }.is_err());
     }
 }

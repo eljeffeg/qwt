@@ -356,8 +356,21 @@ where
     let sigma: T = sigma_u.as_();
     let n_levels = get_u16(bytes, &mut o) as usize;
     let _ = o;
+    let max_type_levels = (size_of::<T>() * u8::BITS as usize).div_ceil(2);
+    if sigma.as_() != sigma_u
+        || n_levels > crate::MAX_QUAD_LEVELS
+        || n_levels > max_type_levels
+        || (n > 0 && n_levels == 0)
+    {
+        return Err(LayoutError::Inconsistent {
+            detail: "plain QWT header values are invalid for the requested type",
+        });
+    }
 
-    let dir_end = HEADER_SIZE + n_levels * LEVEL_DIR_SIZE;
+    let dir_end = n_levels
+        .checked_mul(LEVEL_DIR_SIZE)
+        .and_then(|size| HEADER_SIZE.checked_add(size))
+        .ok_or(LayoutError::Truncated)?;
     if bytes.len() < dir_end {
         return Err(LayoutError::Truncated);
     }
@@ -375,8 +388,18 @@ where
         let data_off = dir.off_data as usize;
         let n_datalines = dir.n_datalines as usize;
         let _ = checked_region(data_off, n_datalines, size_of::<DataLine>(), bytes.len())?;
-        let lines = copy_pod_slice::<DataLine>(&bytes[data_off..], n_datalines)?;
-        let qv = QVector::from_raw_parts(lines, dir.position_bits as usize);
+        // SAFETY: DataLine is repr(C), contains only integers, and accepts every bit pattern.
+        let lines = unsafe { copy_pod_slice::<DataLine>(&bytes[data_off..], n_datalines)? };
+        let position_bits =
+            usize::try_from(dir.position_bits).map_err(|_| LayoutError::Inconsistent {
+                detail: "position_bits exceeds usize",
+            })?;
+        if !position_bits.is_multiple_of(2) || position_bits > n_datalines.saturating_mul(512) {
+            return Err(LayoutError::Inconsistent {
+                detail: "position_bits is invalid for the data payload",
+            });
+        }
+        let qv = QVector::from_raw_parts(lines, position_bits);
 
         // Superblocks
         if !(dir.off_superblocks as usize).is_multiple_of(64) {
@@ -390,25 +413,18 @@ where
             size_of::<SuperblockPlain>(),
             bytes.len(),
         )?;
-        let superblocks = copy_pod_slice::<SuperblockPlain>(&bytes[sb_off..], n_superblocks)?;
 
         // Select samples
-        let mut select_samples: [Box<[u32]>; 4] = Default::default();
-        for (s, sample_slot) in select_samples.iter_mut().enumerate() {
+        for s in 0..4 {
             let n_sel = dir.n_sel[s] as usize;
             let off = dir.off_sel[s] as usize;
             let _ = checked_region(off, n_sel, size_of::<u32>(), bytes.len())?;
-            let mut v = Vec::with_capacity(n_sel);
-            for i in 0..n_sel {
-                let b = off + i * 4;
-                v.push(u32::from_le_bytes(bytes[b..b + 4].try_into().unwrap()));
-            }
-            *sample_slot = v.into_boxed_slice();
         }
 
-        let rs = RSSupportPlain::<B>::from_parts(superblocks, select_samples);
-        let n_occs: [usize; 5] = std::array::from_fn(|i| dir.n_occs_smaller[i] as usize);
-        qvs.push(RSQVector::from_parts(qv, rs, n_occs));
+        // Rebuild all rank/select metadata from the validated symbol payload.
+        // Persisted counters are an untrusted cache and must never reach the
+        // owned structure's unchecked query paths.
+        qvs.push(RSQVector::<RSSupportPlain<B>>::from(qv));
     }
 
     // Empty-tree convention in qwt::new uses one default level; from_parts
@@ -484,6 +500,22 @@ mod tests {
         bytes[0] = b'X';
         let err = qwt256_from_bytes::<u32>(&bytes).unwrap_err();
         assert_eq!(err, LayoutError::BadMagic);
+    }
+
+    #[test]
+    fn qwtb_rejects_sigma_that_disagrees_with_payload() {
+        let mut bytes = qwt256_to_bytes(&QWT256::from(vec![1u32, 2, 3])).unwrap();
+        bytes[16..24].copy_from_slice(&2u64.to_le_bytes());
+        let error = qwt256_from_bytes::<u32>(&bytes).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
+    }
+
+    #[test]
+    fn qwtb_owned_decoder_rejects_invalid_position_without_panicking() {
+        let mut bytes = qwt256_to_bytes(&QWT256::from(vec![1u32, 2, 3])).unwrap();
+        bytes[HEADER_SIZE + 16..HEADER_SIZE + 24].copy_from_slice(&1u64.to_le_bytes());
+        let error = qwt256_from_bytes::<u32>(&bytes).unwrap_err();
+        assert!(matches!(error, LayoutError::Inconsistent { .. }));
     }
 
     #[test]
