@@ -10,6 +10,9 @@ pub use qvector::{DataLine, QVector, QVectorBuilder};
 use std::marker::PhantomData;
 use std::ops::{Range, RangeBounds};
 
+/// Maximum number of 2-bit levels needed by the widest supported integer.
+pub(crate) const MAX_QUAD_LEVELS: usize = u128::BITS as usize / 2;
+
 pub mod bitvector;
 #[deprecated(since = "0.5.0", note = "renamed to `qwt::narrow::RS`")]
 pub use bitvector::narrow::RS as RSNarrow;
