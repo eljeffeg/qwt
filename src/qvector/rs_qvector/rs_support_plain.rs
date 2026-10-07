@@ -13,10 +13,16 @@ use serde::{Deserialize, Serialize};
 /// The possible values are 256 (default) and 512.
 /// The space overhead for 256 is 12.5% while 512 halves this
 /// space overhead (6.25%) at the cost of (slightly) increasing the query time.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, MemSize, MemDbg, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, MemSize, MemDbg, PartialEq)]
 pub struct RSSupportPlain<const B_SIZE: usize = 256> {
     superblocks: Box<[SuperblockPlain]>,
     select_samples: [Box<[u32]>; 4],
+}
+
+impl<const B_SIZE: usize> Default for RSSupportPlain<B_SIZE> {
+    fn default() -> Self {
+        Self::new(&QVector::default())
+    }
 }
 
 impl<const B_SIZE: usize> RSSupport for RSSupportPlain<B_SIZE> {
@@ -124,7 +130,7 @@ impl<const B_SIZE: usize> RSSupport for RSSupportPlain<B_SIZE> {
     /// Returns the number of occurrences of `symbol` up to the beginning
     /// of the block that contains position `i`.
     #[inline(always)]
-    fn rank_block(&self, symbol: u8, i: usize) -> usize {
+    unsafe fn rank_block(&self, symbol: u8, i: usize) -> usize {
         debug_assert!(symbol <= 3, "Symbols are in [0, 3].");
 
         let superblock_index = Self::superblock_index(i);
@@ -143,7 +149,7 @@ impl<const B_SIZE: usize> RSSupport for RSSupportPlain<B_SIZE> {
     ///
     /// The caller must guarantee that `i` is not zero or greater than the length of the indexed sequence.
     #[inline(always)]
-    fn select_block(&self, symbol: u8, i: usize) -> (usize, usize) {
+    unsafe fn select_block(&self, symbol: u8, i: usize) -> (usize, usize) {
         let sampled_i = (i - 1) / Self::SELECT_NUM_SAMPLES;
 
         let mut first_sblock_id = self.select_samples[symbol as usize][sampled_i] as usize;
@@ -221,8 +227,15 @@ impl<const B_SIZE: usize> RSSupportPlain<B_SIZE> {
     ///
     /// Inverse of [`superblocks`](Self::superblocks) +
     /// [`select_samples`](Self::select_samples). Used by zero-copy I/O.
+    ///
+    /// # Safety
+    ///
+    /// The counters and samples must be a valid rank/select representation
+    /// derived from the same quad vector that this support will index.
+    /// Invalid lengths or counters can make rank/select operations access
+    /// support storage out of bounds.
     #[must_use]
-    pub fn from_parts(
+    pub unsafe fn from_parts(
         superblocks: Box<[SuperblockPlain]>,
         select_samples: [Box<[u32]>; 4],
     ) -> Self {
@@ -272,7 +285,12 @@ impl SuperblockPlain {
 
     #[inline(always)]
     pub fn get_rank(&self, symbol: u8, block_id: usize) -> usize {
-        let data = unsafe { *self.counters.get_unchecked(symbol as usize) };
+        assert!(symbol < 4, "symbols are in [0, 3]");
+        assert!(
+            block_id < Self::BLOCKS_IN_SUPERBLOCK,
+            "block id is in [0, 7]"
+        );
+        let data = self.counters[symbol as usize];
         let sb = (data >> 84) as usize;
 
         // We avoid a branch here. We want b be 0 if block_id is 0, real counter extracted from data otherwise
@@ -287,11 +305,15 @@ impl SuperblockPlain {
     /// Fused 4-symbol block ranks (loads one superblock once).
     #[inline(always)]
     pub fn get_rank_all(&self, block_id: usize) -> [usize; 4] {
+        assert!(
+            block_id < Self::BLOCKS_IN_SUPERBLOCK,
+            "block id is in [0, 7]"
+        );
         let not_first = (block_id > 0) as usize;
         let shift = (block_id - not_first) * 12;
         let mut out = [0usize; 4];
         for (symbol, slot) in out.iter_mut().enumerate() {
-            let data = unsafe { *self.counters.get_unchecked(symbol) };
+            let data = self.counters[symbol];
             let sb = (data >> 84) as usize;
             let b = ((data >> shift) as usize & 0b111111111111) * not_first;
             *slot = sb + b;
@@ -303,7 +325,8 @@ impl SuperblockPlain {
     /// Exposed for zero-copy / mmap flatten.
     #[inline(always)]
     pub fn get_superblock_counter(&self, symbol: u8) -> usize {
-        (unsafe { *self.counters.get_unchecked(symbol as usize) } >> 84) as usize
+        assert!(symbol < 4, "symbols are in [0, 3]");
+        (self.counters[symbol as usize] >> 84) as usize
     }
 
     fn set_block_counters(&mut self, block_id: usize, counters: &[usize; 4]) {
@@ -339,6 +362,7 @@ impl SuperblockPlain {
     /// predecessor x of a 12bit value in the last 84 bits of a u128.
     #[inline(always)]
     pub fn block_predecessor(&self, symbol: u8, target: usize) -> (usize, usize) {
+        assert!(symbol < 4, "symbols are in [0, 3]");
         let mut cnt = self.counters[symbol as usize];
         let mut prev_cnt = 0;
 

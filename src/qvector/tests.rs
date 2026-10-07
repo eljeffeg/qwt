@@ -1,15 +1,15 @@
 use super::*;
 
 #[test]
-fn deserialize_rejects_position_beyond_data_capacity() {
-    #[derive(Serialize)]
-    struct QVectorWire {
+fn serde_rejects_position_outside_data_capacity() {
+    #[derive(serde::Serialize)]
+    struct InvalidQVector {
         data: Box<[DataLine]>,
         position: usize,
     }
 
-    let bytes = bincode::serialize(&QVectorWire {
-        data: Box::new([]),
+    let bytes = bincode::serialize(&InvalidQVector {
+        data: Vec::new().into_boxed_slice(),
         position: 2,
     })
     .unwrap();
@@ -25,6 +25,21 @@ fn test_empty() {
     let qv: QVector = [0, 1, 2, 3].into_iter().cycle().take(10).collect();
     assert!(!qv.is_empty());
     assert_eq!(qv.len(), 10);
+}
+
+#[test]
+fn default_rank_support_has_a_valid_empty_sentinel() {
+    let qv = crate::RSQVector256::default();
+    assert_eq!(crate::RankQuad::rank(&qv, 0, 0), Some(0));
+    assert_eq!(crate::SelectQuad::select(&qv, 0, 0), None);
+}
+
+#[test]
+fn unchecked_select_accepts_zero_based_valid_occurrences() {
+    let qv = crate::RSQVector256::new(&[2_u8, 0, 2, 1, 2]);
+    // SAFETY: symbol 2 has three occurrences, so indices 0 and 2 are valid.
+    assert_eq!(unsafe { crate::SelectQuad::select_unchecked(&qv, 2, 0) }, 0);
+    assert_eq!(unsafe { crate::SelectQuad::select_unchecked(&qv, 2, 2) }, 4);
 }
 
 #[test]
@@ -88,6 +103,34 @@ fn test_data_line() {
         for i in 0..=256 {
             dbg!(i, symbol);
             assert_eq!(data_line.rank(symbol, i), Some(i));
+        }
+    }
+}
+
+#[test]
+fn data_line_access_crosses_native_lane_boundaries() {
+    let mut data_line = DataLine::default();
+    let expected =
+        std::array::from_fn::<_, 256, _>(|position| ((position / 64 + position % 3) % 4) as u8);
+    for (position, &symbol) in expected.iter().enumerate() {
+        data_line.set_symbol(symbol, position as u8);
+    }
+    for (position, &symbol) in expected.iter().enumerate() {
+        assert_eq!(data_line.get(position), Some(symbol));
+    }
+}
+
+#[test]
+fn data_line_rank_all_matches_scalar_rank() {
+    let mut data_line = DataLine::default();
+    for position in 0..=255u8 {
+        data_line.set_symbol(position % 4, position);
+    }
+    for end in 0..=256 {
+        // SAFETY: every tested boundary is within the 256-symbol line.
+        let all = unsafe { data_line.rank_all_unchecked(end) };
+        for symbol in 0..4u8 {
+            assert_eq!(all[symbol as usize], data_line.rank(symbol, end).unwrap());
         }
     }
 }
