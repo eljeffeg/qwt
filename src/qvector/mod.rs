@@ -10,7 +10,7 @@ use crate::{AccessQuad, RankQuad}; // Traits
 use mem_dbg::{MemDbg, MemSize};
 use num_traits::int::PrimInt;
 use num_traits::AsPrimitive;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // A quad vector is made of `DataLine`s. Each line consists of
 // four u128, so each `DataLine` is 512 bits and fits in a cache line.
@@ -76,14 +76,30 @@ impl AccessQuad for DataLine {
 
     #[inline(always)]
     unsafe fn get_unchecked(&self, i: usize) -> u8 {
-        let word_id_high = i >> 7;
-        let word_id_low = word_id_high + 2;
-        let cur_shift = i & 127;
+        #[cfg(target_endian = "little")]
+        {
+            let lane = i >> 6;
+            let shift = i & 63;
+            let words = self.words.as_ptr().cast::<u64>();
+            // SAFETY: `i < 256`, so `lane < 4`; the low-bit plane starts
+            // four native lanes after the high-bit plane in the validated
+            // little-endian `[u128; 4]` representation.
+            let word_high = unsafe { *words.add(lane) };
+            let word_low = unsafe { *words.add(lane + 4) };
+            return (((word_high >> shift) & 1) << 1 | (word_low >> shift) & 1) as u8;
+        }
 
-        let word_high = unsafe { *self.words.get_unchecked(word_id_high) };
-        let word_low = unsafe { *self.words.get_unchecked(word_id_low) };
+        #[cfg(target_endian = "big")]
+        {
+            let word_id_high = i >> 7;
+            let word_id_low = word_id_high + 2;
+            let cur_shift = i & 127;
 
-        ((word_high >> (cur_shift) & 1) << 1 | (word_low >> cur_shift) & 1) as u8
+            let word_high = unsafe { *self.words.get_unchecked(word_id_high) };
+            let word_low = unsafe { *self.words.get_unchecked(word_id_low) };
+
+            ((word_high >> (cur_shift) & 1) << 1 | (word_low >> cur_shift) & 1) as u8
+        }
     }
 }
 
@@ -183,10 +199,36 @@ impl RankQuad for DataLine {
 
 // The trait SelectQuad is not implemented because RSSupport needs to it by hand :-)
 
-#[derive(Clone, Default, Eq, PartialEq, Serialize, MemSize, MemDbg, Deserialize, Debug)]
+#[derive(Clone, Default, Eq, PartialEq, Serialize, MemSize, MemDbg, Debug)]
 pub struct QVector {
     data: Box<[DataLine]>,
     position: usize,
+}
+
+#[derive(Deserialize)]
+struct QVectorSerde {
+    data: Box<[DataLine]>,
+    position: usize,
+}
+
+impl<'de> Deserialize<'de> for QVector {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decoded = QVectorSerde::deserialize(deserializer)?;
+        if !decoded.position.is_multiple_of(2)
+            || decoded.position > decoded.data.len().saturating_mul(512)
+        {
+            return Err(serde::de::Error::custom(
+                "QVector position is outside its data capacity",
+            ));
+        }
+        Ok(Self {
+            data: decoded.data,
+            position: decoded.position,
+        })
+    }
 }
 
 impl QVector {

@@ -7,7 +7,7 @@ use crate::{AccessQuad, RankQuad, SelectQuad, WTSupport};
 use mem_dbg::{MemDbg, MemSize};
 use num_traits::int::PrimInt;
 use num_traits::{AsPrimitive, Unsigned};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Alternative representations to support Rank/Select queries at the level of blocks
 mod rs_support_plain;
@@ -19,11 +19,36 @@ pub type RSQVector512 = RSQVector<RSSupportPlain<512>>;
 
 /// The generic `S` is the data structure used to provide rank/select
 /// support at the level of blocks.
-#[derive(Default, Clone, PartialEq, Debug, Serialize, MemSize, MemDbg, Deserialize)]
+#[derive(Default, Clone, PartialEq, Debug, Serialize, MemSize, MemDbg)]
 pub struct RSQVector<S> {
     qv: QVector,
     rs_support: S,
     n_occs_smaller: [usize; 5], /* for each symbol c, store the number of occurrences of in qv of symbols smaller than c. We store 5 (instead of 4) counters so we can use them to compute also the number of occurrences of each symbol without branches. */
+}
+
+#[derive(Deserialize)]
+struct RSQVectorSerde<S> {
+    qv: QVector,
+    rs_support: S,
+    n_occs_smaller: [usize; 5],
+}
+
+impl<'de, S> Deserialize<'de> for RSQVector<S>
+where
+    S: RSSupport + Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decoded = RSQVectorSerde::<S>::deserialize(deserializer)?;
+        // Rank/select support is persisted only as a cache. Rebuild it from
+        // the validated QVector so crafted counters can never reach unsafe
+        // query primitives.
+        let _ = decoded.rs_support;
+        let _ = decoded.n_occs_smaller;
+        Ok(Self::from(decoded.qv))
+    }
 }
 
 impl<S> RSQVector<S> {
@@ -298,8 +323,15 @@ impl<S: RSSupport> RSQVector<S> {
     ///
     /// Inverse of [`qvector`](Self::qvector) + [`rs_support`](Self::rs_support) +
     /// [`n_occs_smaller`](Self::n_occs_smaller). Used by zero-copy I/O.
+    ///
+    /// # Safety
+    ///
+    /// `rs_support` and `n_occs_smaller` must have been derived from exactly
+    /// `qv` and must satisfy all invariants established by [`Self::from`].
+    /// Forged metadata can make otherwise-safe rank/select queries access
+    /// rank-support storage out of bounds.
     #[must_use]
-    pub fn from_parts(qv: QVector, rs_support: S, n_occs_smaller: [usize; 5]) -> Self {
+    pub unsafe fn from_parts(qv: QVector, rs_support: S, n_occs_smaller: [usize; 5]) -> Self {
         Self {
             qv,
             rs_support,
@@ -381,7 +413,7 @@ impl<S: RSSupport> RankQuad for RSQVector<S> {
     #[inline(always)]
     unsafe fn rank_unchecked(&self, symbol: u8, i: usize) -> usize {
         debug_assert!(symbol <= 3);
-        self.rs_support.rank_block(symbol, i) + self.rank_intra_block(symbol, i)
+        (unsafe { self.rs_support.rank_block(symbol, i) }) + self.rank_intra_block(symbol, i)
     }
 
     /// Ranks of all four symbols at position `i` with shared block/data loads.
@@ -397,12 +429,14 @@ impl<S: RSSupport> RankQuad for RSQVector<S> {
         let block_ranks = {
             // Access via rank_block for each symbol still hits the same cache line;
             // prefer specialized path when available through public rank_block.
-            [
-                self.rs_support.rank_block(0, i),
-                self.rs_support.rank_block(1, i),
-                self.rs_support.rank_block(2, i),
-                self.rs_support.rank_block(3, i),
-            ]
+            unsafe {
+                [
+                    self.rs_support.rank_block(0, i),
+                    self.rs_support.rank_block(1, i),
+                    self.rs_support.rank_block(2, i),
+                    self.rs_support.rank_block(3, i),
+                ]
+            }
         };
         // Silence unused when BLOCK_SIZE path uses different indexing helpers.
         let _ = (superblock_index, block_index);
@@ -439,7 +473,9 @@ impl<S: RSSupport> SelectQuad for RSQVector<S> {
             return None;
         }
 
-        let (mut pos, rank) = self.rs_support.select_block(symbol, i + 1);
+        // SAFETY: the occurrence count check above proves the requested
+        // sample exists in support derived from this QVector.
+        let (mut pos, rank) = unsafe { self.rs_support.select_block(symbol, i + 1) };
 
         // if rank == i {
         //     return Some(pos);
@@ -453,17 +489,15 @@ impl<S: RSSupport> SelectQuad for RSQVector<S> {
     /// Returns the position of the `i+1`th occurrence of `symbol`.
     ///
     /// # Safety
-    /// Calling this method with a value of `i` which is larger than the number of
-    /// occurrences of the `symbol` or if `symbol is larger than 3 is
-    /// undefined behavior.
+    /// Calling this method when the `i`th occurrence of `symbol` does not exist,
+    /// or when `symbol` is larger than 3, is undefined behavior.
     ///
     /// In the current implementation there is no reason to prefer this unsafe select
     /// over the safe one.
     #[inline]
     unsafe fn select_unchecked(&self, symbol: u8, i: usize) -> usize {
         debug_assert!(symbol <= 3);
-        debug_assert!(i > 0);
-        debug_assert!(self.occs(symbol) <= Some(i));
+        debug_assert!(i < unsafe { self.occs_unchecked(symbol) });
 
         self.select(symbol, i).unwrap()
     }
@@ -522,7 +556,7 @@ impl<S: RSSupport> WTSupport for RSQVector<S> {
     /// if the position `i` is out of bound is undefined behavior.
     #[inline(always)]
     unsafe fn rank_block_unchecked(&self, symbol: u8, i: usize) -> usize {
-        self.rs_support.rank_block(symbol, i)
+        unsafe { self.rs_support.rank_block(symbol, i) }
     }
 
     /// Prefetches counters of the superblock and blocks containing the position `pos`.
@@ -578,12 +612,18 @@ pub trait RSSupport {
     /// of the block that contains position `i`.
     ///
     /// We use a const generic to have a specialized method for each symbol.
-    fn rank_block(&self, symbol: u8, i: usize) -> usize;
+    /// # Safety
+    /// `symbol` must be in `0..4`, and `i` must be a valid position in the
+    /// QVector from which this support was built.
+    unsafe fn rank_block(&self, symbol: u8, i: usize) -> usize;
 
     /// Returns a pair `(position, rank)` where the position is the beginning of the block
     /// that contains the `i`th occurrence of `symbol`, and `rank` is the number of
     /// occurrences of `symbol` up to the beginning of this block.
-    fn select_block(&self, symbol: u8, i: usize) -> (usize, usize);
+    /// # Safety
+    /// `symbol` must be in `0..4`, and `i` must name an existing occurrence
+    /// in the QVector from which this support was built.
+    unsafe fn select_block(&self, symbol: u8, i: usize) -> (usize, usize);
 
     fn prefetch(&self, pos: usize);
 }
