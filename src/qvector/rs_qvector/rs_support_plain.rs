@@ -221,8 +221,15 @@ impl<const B_SIZE: usize> RSSupportPlain<B_SIZE> {
     ///
     /// Inverse of [`superblocks`](Self::superblocks) +
     /// [`select_samples`](Self::select_samples). Used by zero-copy I/O.
+    ///
+    /// # Safety
+    ///
+    /// The counters and samples must be a valid rank/select representation
+    /// derived from the same quad vector that this support will index.
+    /// Invalid lengths or counters can make rank/select operations access
+    /// support storage out of bounds.
     #[must_use]
-    pub fn from_parts(
+    pub unsafe fn from_parts(
         superblocks: Box<[SuperblockPlain]>,
         select_samples: [Box<[u32]>; 4],
     ) -> Self {
