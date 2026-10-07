@@ -520,6 +520,74 @@ impl<'a, const B_SIZE: usize> RSQVectorView<'a, B_SIZE> {
         (pos < self.len()).then_some(pos)
     }
 
+    /// Advances from one selected occurrence to a later occurrence of the
+    /// same symbol by scanning the intervening packed data lines once.
+    ///
+    /// `position` must name an occurrence of `symbol`; `advance` is the
+    /// positive number of matching occurrences to skip forward. This is the
+    /// level-local primitive used by fixed-symbol wavelet cursors, whose
+    /// reverse path requests monotonically increasing occurrence ranks.
+    pub(super) fn select_after(
+        &self,
+        symbol: u8,
+        position: usize,
+        mut advance: usize,
+    ) -> Option<usize> {
+        if symbol > 3 || position >= self.len() || advance == 0 {
+            return None;
+        }
+
+        let mut next = position.checked_add(1)?;
+        while next < self.len() {
+            let line_index = next >> 8;
+            let offset = next & 255;
+            let (mut low, mut high) = self.data.get(line_index)?.normalize(symbol);
+
+            if offset < 128 {
+                low &= u128::MAX << offset;
+            } else {
+                low = 0;
+                high &= u128::MAX << (offset - 128);
+            }
+
+            // Monotone wavelet cursors most often request the immediately
+            // following occurrence, including every deepest-level step. In
+            // that case the first set bit is the answer: avoid both POPCNTs
+            // and the general nth-set-bit selector while preserving the same
+            // packed-line scan and ordering contract.
+            if advance == 1 {
+                if low != 0 {
+                    let selected = line_index * 256 + low.trailing_zeros() as usize;
+                    return (selected < self.len()).then_some(selected);
+                }
+                if high != 0 {
+                    let selected = line_index * 256 + 128 + high.trailing_zeros() as usize;
+                    return (selected < self.len()).then_some(selected);
+                }
+                next = (line_index + 1).checked_mul(256)?;
+                continue;
+            }
+
+            let low_count = low.count_ones() as usize;
+            if advance <= low_count {
+                let selected = select_in_word_u128(low, (advance - 1) as u64) as usize;
+                let selected = line_index * 256 + selected;
+                return (selected < self.len()).then_some(selected);
+            }
+            advance -= low_count;
+
+            let high_count = high.count_ones() as usize;
+            if advance <= high_count {
+                let selected = select_in_word_u128(high, (advance - 1) as u64) as usize;
+                let selected = line_index * 256 + 128 + selected;
+                return (selected < self.len()).then_some(selected);
+            }
+            advance -= high_count;
+            next = (line_index + 1).checked_mul(256)?;
+        }
+        None
+    }
+
     #[inline(always)]
     fn rank_block(&self, symbol: u8, i: usize) -> usize {
         let superblock_index = i / (B_SIZE * BLOCKS_IN_SUPERBLOCK);

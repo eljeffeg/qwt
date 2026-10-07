@@ -26,7 +26,7 @@ pub use error::LayoutError;
 pub use hqwb::{hqwt256_from_bytes, hqwt256_to_bytes, hqwt512_from_bytes, hqwt512_to_bytes};
 pub use level::RSQVectorView;
 pub use qwtb::{qwt256_from_bytes, qwt256_to_bytes, qwt512_from_bytes, qwt512_to_bytes};
-pub use view::{AlignedBytes, HqwtView, QwtView};
+pub use view::{AlignedBytes, HqwtView, QwtSelectCursor, QwtView};
 
 #[allow(unused_imports)] // cast_slice_mut / write_slice kept for future writers
 pub(crate) use util::{
