@@ -2,6 +2,8 @@
 
 pub use mem_dbg;
 
+pub(crate) const MAX_QUAD_LEVELS: usize = u128::BITS as usize / 2;
+
 pub mod perf_and_test_utils;
 pub mod qvector;
 use num_traits::AsPrimitive;

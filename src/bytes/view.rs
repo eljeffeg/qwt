@@ -11,7 +11,7 @@ use super::{
 };
 use crate::quadwt::huffqwt::PrefixCode;
 use crate::quadwt::WTIndexable;
-use crate::{AccessUnsigned, RankUnsigned, SelectUnsigned};
+use crate::{AccessUnsigned, RankUnsigned, SelectUnsigned, MAX_QUAD_LEVELS};
 use num_traits::AsPrimitive;
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -33,6 +33,24 @@ pub struct QwtView<'a, T, const B_SIZE: usize = 256> {
     sigma: T,
     levels: Vec<RSQVectorView<'a, B_SIZE>>,
     _marker: PhantomData<&'a [u8]>,
+}
+
+/// Allocation-free iterator over the ascending positions of one symbol in a
+/// borrowed plain QWT.
+///
+/// The first position uses the ordinary sampled select support. Later
+/// positions reuse the monotone reverse path and scan each intervening packed
+/// level range once, avoiding a fresh sampled select search at every level.
+pub struct QwtSelectCursor<'q, 'a, T, const B_SIZE: usize = 256> {
+    view: &'q QwtView<'a, T, B_SIZE>,
+    symbol: T,
+    path_offsets: [usize; MAX_QUAD_LEVELS],
+    rank_path_offsets: [usize; MAX_QUAD_LEVELS],
+    level_positions: [usize; MAX_QUAD_LEVELS],
+    level_inputs: [usize; MAX_QUAD_LEVELS],
+    next_occurrence: usize,
+    occurrences: usize,
+    initialized: bool,
 }
 
 impl<'a, T, const B_SIZE: usize> QwtView<'a, T, B_SIZE>
@@ -126,6 +144,47 @@ where
     #[inline]
     pub fn levels(&self) -> &[RSQVectorView<'a, B_SIZE>] {
         &self.levels
+    }
+
+    /// Iterates every occurrence of `symbol` in ascending source position.
+    ///
+    /// Construction and traversal allocate no memory. Returns `None` when the
+    /// symbol is outside this tree's alphabet or the tree is empty.
+    pub fn select_cursor(&self, symbol: T) -> Option<QwtSelectCursor<'_, 'a, T, B_SIZE>> {
+        if self.n_levels == 0 || symbol > self.sigma || self.n_levels > MAX_QUAD_LEVELS {
+            return None;
+        }
+
+        let mut path_offsets = [0usize; MAX_QUAD_LEVELS];
+        let mut rank_path_offsets = [0usize; MAX_QUAD_LEVELS];
+        let mut begin = 0usize;
+        let mut end = self.n;
+        let mut shift: i64 = 2 * (self.n_levels - 1) as i64;
+
+        for level in 0..self.n_levels {
+            path_offsets[level] = begin;
+            let digit = ((symbol >> shift as usize).as_() & 3) as u8;
+            let vector = &self.levels[level];
+            let begin_rank = unsafe { vector.rank_unchecked(digit, begin) };
+            let end_rank = unsafe { vector.rank_unchecked(digit, end) };
+            let offset = unsafe { vector.occs_smaller_unchecked(digit) };
+            begin = begin_rank + offset;
+            end = end_rank + offset;
+            rank_path_offsets[level] = begin_rank;
+            shift -= 2;
+        }
+
+        Some(QwtSelectCursor {
+            view: self,
+            symbol,
+            path_offsets,
+            rank_path_offsets,
+            level_positions: [0; MAX_QUAD_LEVELS],
+            level_inputs: [0; MAX_QUAD_LEVELS],
+            next_occurrence: 0,
+            occurrences: end.checked_sub(begin)?,
+            initialized: false,
+        })
     }
 
     /// Returns the symbol at position `i` together with `rank(symbol, i + 1)`
@@ -389,6 +448,53 @@ where
             );
         }
     }
+}
+
+impl<T, const B_SIZE: usize> Iterator for QwtSelectCursor<'_, '_, T, B_SIZE>
+where
+    T: WTIndexable,
+    usize: AsPrimitive<T>,
+{
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_occurrence >= self.occurrences {
+            return None;
+        }
+
+        let mut result = self.next_occurrence;
+        let mut shift = 0usize;
+        for level in (0..self.view.n_levels).rev() {
+            let digit = ((self.symbol >> shift).as_() & 3) as u8;
+            let vector = &self.view.levels[level];
+            let position = if self.initialized {
+                let advance = result.checked_sub(self.level_inputs[level])?;
+                vector.select_after(digit, self.level_positions[level], advance)?
+            } else {
+                vector.select(digit, self.rank_path_offsets[level] + result)?
+            };
+            self.level_inputs[level] = result;
+            self.level_positions[level] = position;
+            result = position.checked_sub(self.path_offsets[level])?;
+            shift += 2;
+        }
+
+        self.initialized = true;
+        self.next_occurrence += 1;
+        Some(result)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.occurrences.saturating_sub(self.next_occurrence);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T, const B_SIZE: usize> ExactSizeIterator for QwtSelectCursor<'_, '_, T, B_SIZE>
+where
+    T: WTIndexable,
+    usize: AsPrimitive<T>,
+{
 }
 
 impl<'a, T, const B_SIZE: usize> AccessUnsigned for QwtView<'a, T, B_SIZE>
@@ -867,8 +973,8 @@ impl std::ops::Deref for AlignedBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytes::{hqwt256_to_bytes, qwt256_to_bytes};
-    use crate::{HQWT256, QWT256};
+    use crate::bytes::{hqwt256_to_bytes, qwt256_to_bytes, qwt512_to_bytes};
+    use crate::{HQWT256, QWT256, QWT512};
 
     #[test]
     fn qwt_view_matches_owned() {
@@ -899,6 +1005,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn qwt_select_cursor_matches_scalar_select_for_complete_symbol_domains() {
+        let data: Vec<u32> = (0..10_037)
+            .map(|row| ((row * 37 + row / 11) % 128) as u32)
+            .collect();
+        let original = QWT256::from(data.clone());
+        let bytes = qwt256_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 256> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+
+        for symbol in 0..=127 {
+            let expected: Vec<_> = data
+                .iter()
+                .enumerate()
+                .filter_map(|(position, value)| (*value == symbol).then_some(position))
+                .collect();
+            let cursor = view
+                .select_cursor(symbol)
+                .expect("symbol belongs to the validated alphabet");
+            assert_eq!(cursor.len(), expected.len());
+            assert_eq!(cursor.collect::<Vec<_>>(), expected, "symbol {symbol}");
+        }
+        assert!(view.select_cursor(128).is_none());
+    }
+
+    #[test]
+    fn qwt_select_cursor_ignores_zero_padding_in_the_last_data_line() {
+        let data = vec![0u32; 257];
+        let original = QWT256::from(data.clone());
+        let bytes = qwt256_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 256> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+
+        assert_eq!(
+            view.select_cursor(0).unwrap().collect::<Vec<_>>(),
+            (0..data.len()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn qwt_select_cursor_walks_immediate_occurrences_across_words_and_lines() {
+        let expected = [0, 1, 63, 64, 127, 128, 129, 255, 256, 257, 511, 512, 769];
+        let mut data = vec![7_u32; 770];
+        for position in expected {
+            data[position] = 3;
+        }
+        let original = QWT256::from(data);
+        let bytes = qwt256_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 256> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+
+        assert_eq!(view.select_cursor(3).unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn qwt512_select_cursor_matches_sparse_scalar_positions() {
+        let data: Vec<u32> = (0..4_099).map(|row| ((row * 19) % 63) as u32).collect();
+        let original = QWT512::from(data.clone());
+        let bytes = qwt512_to_bytes(&original).unwrap();
+        let aligned = AlignedBytes::from_slice(&bytes);
+        let view: QwtView<'_, u32, 512> = QwtView::from_bytes(aligned.as_slice()).unwrap();
+
+        for symbol in 0..=62 {
+            let expected: Vec<_> = data
+                .iter()
+                .enumerate()
+                .filter_map(|(position, value)| (*value == symbol).then_some(position))
+                .collect();
+            assert_eq!(
+                view.select_cursor(symbol).unwrap().collect::<Vec<_>>(),
+                expected,
+                "symbol {symbol}"
+            );
+        }
+        assert!(view.select_cursor(63).is_none());
     }
 
     #[test]
