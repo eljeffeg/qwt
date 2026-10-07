@@ -298,8 +298,15 @@ impl<S: RSSupport> RSQVector<S> {
     ///
     /// Inverse of [`qvector`](Self::qvector) + [`rs_support`](Self::rs_support) +
     /// [`n_occs_smaller`](Self::n_occs_smaller). Used by zero-copy I/O.
+    ///
+    /// # Safety
+    ///
+    /// `rs_support` and `n_occs_smaller` must have been derived from exactly
+    /// `qv` and must satisfy all invariants established by [`Self::from`].
+    /// Forged metadata can make otherwise-safe rank/select queries access
+    /// rank-support storage out of bounds.
     #[must_use]
-    pub fn from_parts(qv: QVector, rs_support: S, n_occs_smaller: [usize; 5]) -> Self {
+    pub unsafe fn from_parts(qv: QVector, rs_support: S, n_occs_smaller: [usize; 5]) -> Self {
         Self {
             qv,
             rs_support,

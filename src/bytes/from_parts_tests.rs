@@ -31,8 +31,9 @@ fn rsqvector_from_parts_eq() {
     let superblocks: Box<[SuperblockPlain]> = rs.superblocks().to_vec().into_boxed_slice();
     let select_samples: [Box<[u32]>; 4] =
         std::array::from_fn(|s| rs.select_samples(s).to_vec().into_boxed_slice());
-    let rs_rebuilt = RSSupportPlain::<256>::from_parts(superblocks, select_samples);
-    let rebuilt = RSQVector256::from_parts(qv, rs_rebuilt, original.n_occs_smaller());
+    // SAFETY: parts are copied verbatim from `rs`, which was built from `qv`.
+    let rs_rebuilt = unsafe { RSSupportPlain::<256>::from_parts(superblocks, select_samples) };
+    let rebuilt = unsafe { RSQVector256::from_parts(qv, rs_rebuilt, original.n_occs_smaller()) };
     assert_eq!(original, rebuilt);
 }
 
@@ -49,8 +50,10 @@ fn clone_hqwt_levels(original: &HQWT256<u32>) -> Vec<RSQVector256> {
             let superblocks = support.superblocks().to_vec().into_boxed_slice();
             let select_samples =
                 std::array::from_fn(|s| support.select_samples(s).to_vec().into_boxed_slice());
-            let rs_support = RSSupportPlain::<256>::from_parts(superblocks, select_samples);
-            RSQVector256::from_parts(qv, rs_support, rs.n_occs_smaller())
+            // SAFETY: parts are copied verbatim from an existing level built from `qv`.
+            let rs_support =
+                unsafe { RSSupportPlain::<256>::from_parts(superblocks, select_samples) };
+            unsafe { RSQVector256::from_parts(qv, rs_support, rs.n_occs_smaller()) }
         })
         .collect()
 }
@@ -72,8 +75,10 @@ fn qwt_from_parts_eq_queries() {
             let superblocks = support.superblocks().to_vec().into_boxed_slice();
             let select_samples =
                 std::array::from_fn(|s| support.select_samples(s).to_vec().into_boxed_slice());
-            let rs_support = RSSupportPlain::<256>::from_parts(superblocks, select_samples);
-            RSQVector256::from_parts(qv, rs_support, rs.n_occs_smaller())
+            // SAFETY: parts are copied verbatim from an existing level built from `qv`.
+            let rs_support =
+                unsafe { RSSupportPlain::<256>::from_parts(superblocks, select_samples) };
+            unsafe { RSQVector256::from_parts(qv, rs_support, rs.n_occs_smaller()) }
         })
         .collect();
 
