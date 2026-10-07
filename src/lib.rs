@@ -22,6 +22,7 @@ pub use bitvector::narrow::RS as RSNarrow;
 pub use bitvector::wide::RS as RSWide;
 pub use bitvector::{narrow, wide, BitVector, BitVectorMut};
 
+mod kernel;
 pub mod utils;
 
 pub mod bytes;
