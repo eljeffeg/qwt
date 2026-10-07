@@ -35,15 +35,16 @@
 //! assert_eq!(qwt.rank(3, 7), Some(1));  // Counts the occurrences of symbol 3 up to position 7, should return 1
 //! assert_eq!(qwt.select(3, 0), Some(2));  // Finds the position of the 1st occurrence of symbol 3, should return Some(2)
 //! ```
-use crate::utils::{msb, stable_partition_of_4};
+use crate::utils::{msb, stable_partition_of_4_into};
 use crate::{
     AccessUnsigned, OccsRangeUnsigned, RankUnsigned, SelectUnsigned, WTIterator, WTSupport,
+    MAX_QUAD_LEVELS,
 };
 use crate::{QVector, QVectorBuilder}; // Traits
 use mem_dbg::{MemDbg, MemSize};
 // Traits bound
 use num_traits::{AsPrimitive, PrimInt, Unsigned};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::marker::PhantomData;
 use std::ops::{Bound, Range, RangeBounds, Shl, Shr};
 
@@ -82,13 +83,44 @@ where
 /// is augmented with extra data to support a deeper level of prefetching.
 /// This extra informationa are needed only for sequences such that data
 /// about superblocks and blocks do not fit in L3 cache.
-#[derive(Default, Clone, PartialEq, Debug, Serialize, MemSize, MemDbg, Deserialize)]
+#[derive(Default, Clone, PartialEq, Debug, Serialize, MemSize, MemDbg)]
 pub struct QWaveletTree<T, RS, const WITH_PREFETCH_SUPPORT: bool = false> {
     n: usize,        // The length of the represented sequence
     n_levels: usize, // The number of levels of the wavelet matrix
     sigma: T, // The largest symbol in the sequence. *NOTE*: It's not +1 because it may overflow
     qvs: Vec<RS>, // A quad vector for each level
     prefetch_support: Option<Vec<PrefetchSupport>>,
+}
+
+#[derive(Deserialize)]
+struct QWaveletTreeSerde<T, RS> {
+    n: usize,
+    n_levels: usize,
+    sigma: T,
+    qvs: Vec<RS>,
+    prefetch_support: Option<Vec<PrefetchSupport>>,
+}
+
+impl<'de, T, RS, const WITH_PREFETCH_SUPPORT: bool> Deserialize<'de>
+    for QWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>
+where
+    T: WTIndexable + Deserialize<'de>,
+    usize: AsPrimitive<T>,
+    RS: RSforWT + Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decoded = QWaveletTreeSerde::<T, RS>::deserialize(deserializer)?;
+        if WITH_PREFETCH_SUPPORT || decoded.prefetch_support.is_some() {
+            return Err(serde::de::Error::custom(
+                "deserializing prefetch-augmented QWT state is not supported",
+            ));
+        }
+        Self::from_parts(decoded.n, decoded.n_levels, decoded.sigma, decoded.qvs)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl<T, RS, const WITH_PREFETCH_SUPPORT: bool> QWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>
@@ -124,6 +156,16 @@ where
     /// ```
     #[must_use]
     pub fn new(sequence: &mut [T]) -> Self {
+        Self::from_owned(sequence.to_vec())
+    }
+
+    /// Owned construction path used by `From<Vec<T>>`.
+    ///
+    /// Each level writes its stable partition into one reusable exact-size
+    /// scratch vector and swaps the two buffers. The input is consumed, so we
+    /// avoid copying the partition back and avoid the four growing bucket
+    /// vectors previously allocated at every level.
+    fn from_owned(mut sequence: Vec<T>) -> Self {
         if sequence.is_empty() {
             return Self {
                 n: 0,
@@ -142,12 +184,15 @@ where
         let mut qvs = Vec::<RS>::with_capacity(n_levels);
 
         let mut shift = 2 * (n_levels - 1);
+        let mut partitioned = vec![T::zero(); sequence.len()];
 
         for _level in 0..n_levels {
             let mut cur_qv = QVectorBuilder::with_capacity(sequence.len());
+            let mut counts = [0usize; 4];
             for &symbol in sequence.iter() {
                 let two_bits: u8 = ((symbol >> shift).as_() & 3) as u8; // take the last 2 bits
                 cur_qv.push(two_bits);
+                counts[two_bits as usize] += 1;
             }
 
             let qv = cur_qv.build();
@@ -158,7 +203,8 @@ where
             }
             qvs.push(RS::from(qv));
 
-            stable_partition_of_4(sequence, shift);
+            stable_partition_of_4_into(&sequence, shift, counts, &mut partitioned);
+            std::mem::swap(&mut sequence, &mut partitioned);
 
             if shift >= 2 {
                 shift -= 2;
@@ -287,17 +333,80 @@ where
         if WITH_PREFETCH_SUPPORT {
             return Err(crate::bytes::LayoutError::PrefetchNotSupported);
         }
+        let max_type_levels = (std::mem::size_of::<T>() * u8::BITS as usize).div_ceil(2);
+        if n_levels > MAX_QUAD_LEVELS || n_levels > max_type_levels {
+            return Err(crate::bytes::LayoutError::Inconsistent {
+                detail: "QWT level count exceeds the supported maximum",
+            });
+        }
         // Empty-tree convention from `new([])`: n_levels == 0 with a single default qv.
         if n == 0 {
-            if n_levels != 0 {
+            if n_levels != 0 || sigma != T::zero() {
                 return Err(crate::bytes::LayoutError::Inconsistent {
-                    detail: "empty tree must have n_levels == 0",
+                    detail: "empty tree must have zero sigma and zero levels",
                 });
             }
-        } else if qvs.len() != n_levels {
+        } else if n_levels == 0 || qvs.len() != n_levels {
             return Err(crate::bytes::LayoutError::Inconsistent {
                 detail: "n_levels disagrees with qvs length",
             });
+        }
+        if n > 0 {
+            let expected_levels = (msb(sigma) + 1).div_ceil(2) as usize;
+            if n_levels != expected_levels {
+                return Err(crate::bytes::LayoutError::Inconsistent {
+                    detail: "n_levels disagrees with sigma",
+                });
+            }
+            for level in &qvs {
+                let level_len = (0..4u8)
+                    .map(|symbol| level.occs(symbol).unwrap_or(usize::MAX))
+                    .try_fold(0usize, usize::checked_add)
+                    .ok_or(crate::bytes::LayoutError::Inconsistent {
+                        detail: "QWT level occurrence counts overflow",
+                    })?;
+                if level_len != n || level.rank(0, n).is_none() {
+                    return Err(crate::bytes::LayoutError::Inconsistent {
+                        detail: "QWT level length disagrees with header length",
+                    });
+                }
+            }
+            let mut actual_sigma = T::zero();
+            for index in 0..n {
+                let mut value = T::zero();
+                let mut current = index;
+                for (level_index, level) in qvs.iter().enumerate() {
+                    let symbol = crate::AccessQuad::get(level, current).ok_or(
+                        crate::bytes::LayoutError::Inconsistent {
+                            detail: "QWT payload transition is out of bounds",
+                        },
+                    )?;
+                    value = (value << 2) | (symbol as usize).as_();
+                    if level_index + 1 < n_levels {
+                        let offset = level.occs_smaller(symbol).ok_or(
+                            crate::bytes::LayoutError::Inconsistent {
+                                detail: "QWT payload contains an invalid symbol",
+                            },
+                        )?;
+                        let rank = crate::RankQuad::rank(level, symbol, current).ok_or(
+                            crate::bytes::LayoutError::Inconsistent {
+                                detail: "QWT payload rank metadata is invalid",
+                            },
+                        )?;
+                        current = offset.checked_add(rank).ok_or(
+                            crate::bytes::LayoutError::Inconsistent {
+                                detail: "QWT payload transition overflows",
+                            },
+                        )?;
+                    }
+                }
+                actual_sigma = actual_sigma.max(value);
+            }
+            if actual_sigma != sigma {
+                return Err(crate::bytes::LayoutError::Inconsistent {
+                    detail: "sigma disagrees with the encoded QWT payload",
+                });
+            }
         }
         Ok(Self {
             n,
@@ -414,7 +523,6 @@ where
             let child_width = 1usize << child_log;
 
             // Collect viable children b=0..3 left-to-right, then push reverse.
-            let mut cand_b = [0u8; 4];
             let mut cand_s = [0usize; 4];
             let mut cand_e = [0usize; 4];
             let mut cand_lo = [0usize; 4];
@@ -431,7 +539,6 @@ where
                 let hi = unsafe { qv.rank_unchecked(b, cur.end) };
                 if hi > lo {
                     let offset = unsafe { qv.occs_smaller_unchecked(b) };
-                    cand_b[nc] = b;
                     cand_s[nc] = offset + lo;
                     cand_e[nc] = offset + hi;
                     cand_lo[nc] = child_sym_lo;
@@ -551,36 +658,31 @@ where
             let mut shift: i64 = (2 * (self.n_levels - 1)) as i64;
             let mut range = 0..i;
 
-            // SAFETY: non-empty trees have `n_levels >= 1` and `qvs.len() == n_levels`.
-            let qv0 = unsafe { self.qvs.get_unchecked(0) };
-            qv0.prefetch_data(range.end);
-            qv0.prefetch_info(range.start);
-            qv0.prefetch_info(range.end);
+            self.qvs[0].prefetch_data(range.end);
+            self.qvs[0].prefetch_info(range.start);
+            self.qvs[0].prefetch_info(range.end);
 
             #[allow(clippy::needless_range_loop)]
             for level in 0..self.n_levels - 1 {
                 let two_bits: u8 = ((symbol >> shift as usize).as_() & 3) as u8;
 
-                // SAFETY: `level < n_levels == qvs.len()` by loop bound; `two_bits` is in [0..3].
-                let qv = unsafe { self.qvs.get_unchecked(level) };
-                let offset = qv.occs_smaller_unchecked(two_bits);
+                // SAFETY: Here we are sure that two_bits is a symbol in [0..3]
+                let offset = self.qvs[level].occs_smaller_unchecked(two_bits);
 
                 let rank_start =
                     prefetch_support[level].approx_rank_unchecked(two_bits, range.start);
                 let rank_end = prefetch_support[level].approx_rank_unchecked(two_bits, range.end);
 
                 range = (rank_start + offset)..(rank_end + offset);
-                // SAFETY: `level + 1 < n_levels` by loop bound.
-                let next = unsafe { self.qvs.get_unchecked(level + 1) };
-                next.prefetch_info(range.start);
-                next.prefetch_info(range.start + 2048);
+                self.qvs[level + 1].prefetch_info(range.start);
+                self.qvs[level + 1].prefetch_info(range.start + 2048);
 
-                next.prefetch_info(range.end);
-                next.prefetch_info(range.end + 2048);
+                self.qvs[level + 1].prefetch_info(range.end);
+                self.qvs[level + 1].prefetch_info(range.end + 2048);
                 if level > 0 {
-                    next.prefetch_info(range.start + 2 * 2048);
-                    next.prefetch_info(range.end + 2 * 2048);
-                    next.prefetch_info(range.end + 3 * 2048);
+                    self.qvs[level + 1].prefetch_info(range.start + 2 * 2048);
+                    self.qvs[level + 1].prefetch_info(range.end + 2 * 2048);
+                    self.qvs[level + 1].prefetch_info(range.end + 3 * 2048);
                 }
                 // self.qvs[level + 1].prefetch_info(range.end + 4 * 2048);
 
@@ -697,33 +799,28 @@ where
 
         const BLOCK_SIZE: usize = 256; // TODO: fix me!
 
-        // SAFETY: non-empty trees have `n_levels >= 1` and `qvs.len() == n_levels`.
-        let qv0 = unsafe { self.qvs.get_unchecked(0) };
-        qv0.prefetch_data(range.start);
-        qv0.prefetch_data(range.end);
+        self.qvs[0].prefetch_data(range.start);
+        self.qvs[0].prefetch_data(range.end);
         for level in 0..self.n_levels - 1 {
             let two_bits: u8 = ((symbol >> shift as usize).as_() & 3) as u8;
 
-            // SAFETY: `level < n_levels == qvs.len()` by loop bound; `two_bits` is in [0..3].
-            let qv = unsafe { self.qvs.get_unchecked(level) };
-            let offset = qv.occs_smaller_unchecked(two_bits);
+            // SAFETY: Here we are sure that two_bits is a symbol in [0..3]
+            let offset = self.qvs[level].occs_smaller_unchecked(two_bits);
 
-            let rank_start = qv.rank_block_unchecked(two_bits, range.start);
-            let rank_end = qv.rank_block_unchecked(two_bits, range.end);
+            let rank_start = self.qvs[level].rank_block_unchecked(two_bits, range.start);
+            let rank_end = self.qvs[level].rank_block_unchecked(two_bits, range.end);
 
             range = (rank_start + offset)..(rank_end + offset);
 
             // The estimated position can be off by BLOCK_SIZE for every level
 
-            // SAFETY: `level + 1 < n_levels` by loop bound.
-            let next = unsafe { self.qvs.get_unchecked(level + 1) };
-            next.prefetch_data(range.start);
-            next.prefetch_data(range.start + BLOCK_SIZE);
+            self.qvs[level + 1].prefetch_data(range.start);
+            self.qvs[level + 1].prefetch_data(range.start + BLOCK_SIZE);
 
-            next.prefetch_data(range.end);
-            next.prefetch_data(range.end + BLOCK_SIZE);
+            self.qvs[level + 1].prefetch_data(range.end);
+            self.qvs[level + 1].prefetch_data(range.end + BLOCK_SIZE);
             for i in 0..level {
-                next.prefetch_data(range.end + 2 * BLOCK_SIZE + i * BLOCK_SIZE);
+                self.qvs[level + 1].prefetch_data(range.end + 2 * BLOCK_SIZE + i * BLOCK_SIZE);
             }
 
             // // CHECK!
@@ -1060,20 +1157,13 @@ where
             let child_start = offset + ranks_s[b];
             let child_end = child_start + cnt;
             let child_prefix: T = (prefix << 2) | b.as_();
-            self.extract_range_distinct_rec(
-                level + 1,
-                child_start,
-                child_end,
-                child_prefix,
-                out,
-            );
+            self.extract_range_distinct_rec(level + 1, child_start, child_end, child_prefix, out);
         }
     }
 }
 
 impl<T, RS, const WITH_PREFETCH_SUPPORT: bool> OccsRangeUnsigned
     for QWaveletTree<T, RS, WITH_PREFETCH_SUPPORT>
-
 where
     T: WTIndexable,
     usize: AsPrimitive<T>,
@@ -1407,6 +1497,9 @@ where
         if i > self.n || symbol > self.sigma {
             return None;
         }
+        if self.n_levels == 0 {
+            return Some(0);
+        }
 
         // SAFETY: Check above guarantees we are not out of bound
         Some(unsafe { self.rank_unchecked(symbol, i) })
@@ -1437,6 +1530,9 @@ where
     /// ```
     #[inline(always)]
     unsafe fn rank_unchecked(&self, symbol: Self::Item, i: usize) -> usize {
+        if self.n_levels == 0 {
+            return 0;
+        }
         let mut shift: i64 = (2 * (self.n_levels - 1)) as i64;
         let mut cur_i = i;
         let mut cur_p = 0;
@@ -1444,21 +1540,18 @@ where
         for level in 0..self.n_levels - 1 {
             let two_bits: u8 = ((symbol >> shift as usize).as_() & 3) as u8;
 
-            // SAFETY: `level < n_levels == qvs.len()` by loop bound; `two_bits` is in [0..3].
-            let qv = unsafe { self.qvs.get_unchecked(level) };
-            let offset = unsafe { qv.occs_smaller_unchecked(two_bits) };
-            cur_p = qv.rank_unchecked(two_bits, cur_p) + offset;
-            cur_i = qv.rank_unchecked(two_bits, cur_i) + offset;
+            // Safety: Here we are sure that two_bits is a symbol in [0..3]
+            let offset = unsafe { self.qvs[level].occs_smaller_unchecked(two_bits) };
+            cur_p = self.qvs[level].rank_unchecked(two_bits, cur_p) + offset;
+            cur_i = self.qvs[level].rank_unchecked(two_bits, cur_i) + offset;
 
             shift -= 2;
         }
 
         let two_bits: u8 = ((symbol >> shift as usize).as_() & 3) as u8;
 
-        // SAFETY: non-empty trees have `n_levels >= 1` and `qvs.len() == n_levels`.
-        let qv = unsafe { self.qvs.get_unchecked(self.n_levels - 1) };
-        cur_i = qv.rank_unchecked(two_bits, cur_i);
-        cur_p = qv.rank_unchecked(two_bits, cur_p);
+        cur_i = self.qvs[self.n_levels - 1].rank_unchecked(two_bits, cur_i);
+        cur_p = self.qvs[self.n_levels - 1].rank_unchecked(two_bits, cur_p);
 
         cur_i - cur_p
     }
@@ -1528,20 +1621,16 @@ where
         for level in 0..self.n_levels - 1 {
             // The last rank can be saved. The improvement is just ~3%. Indeed, most of the cost is for the cache miss for data access that we pay anyway
 
-            // SAFETY: `level < n_levels == qvs.len()` by loop bound.
-            let qv = unsafe { self.qvs.get_unchecked(level) };
-            qv.prefetch_info(cur_i); // Compiler is not able to infer that later it is needed for the rank query. Access is roughly 33% slower for large files without this.
-            let symbol = qv.get_unchecked(cur_i);
+            self.qvs[level].prefetch_info(cur_i); // Compiler is not able to infer that later it is needed for the rank query. Access is roughly 33% slower for large files without this.
+            let symbol = self.qvs[level].get_unchecked(cur_i);
             result = (result << 2) | (symbol as usize).as_();
 
             // SAFETY: Here we are sure that symbol is in [0..3]
-            let offset = unsafe { qv.occs_smaller_unchecked(symbol) };
-            cur_i = qv.rank_unchecked(symbol, cur_i) + offset;
+            let offset = unsafe { self.qvs[level].occs_smaller_unchecked(symbol) };
+            cur_i = self.qvs[level].rank_unchecked(symbol, cur_i) + offset;
         }
 
-        // SAFETY: non-empty trees have `n_levels >= 1` and `qvs.len() == n_levels`.
-        let qv = unsafe { self.qvs.get_unchecked(self.n_levels - 1) };
-        let symbol = qv.get_unchecked(cur_i);
+        let symbol = self.qvs[self.n_levels - 1].get_unchecked(cur_i);
         (result << 2) | (symbol as usize).as_()
     }
 }
@@ -1579,26 +1668,27 @@ where
             return None;
         }
 
-        let mut path_off = Vec::with_capacity(self.n_levels);
-        let mut rank_path_off = Vec::with_capacity(self.n_levels);
+        if self.n_levels > MAX_QUAD_LEVELS {
+            return None;
+        }
+        let mut path_off = [0usize; MAX_QUAD_LEVELS];
+        let mut rank_path_off = [0usize; MAX_QUAD_LEVELS];
 
         let mut b = 0;
         let mut shift: i64 = 2 * (self.n_levels - 1) as i64;
 
         for level in 0..self.n_levels {
-            path_off.push(b);
+            path_off[level] = b;
 
             let two_bits = (symbol >> shift as usize).as_() & 3;
 
-            // SAFETY: `level < n_levels == qvs.len()` by loop bound.
-            let qv = unsafe { self.qvs.get_unchecked(level) };
-            let rank_b = qv.rank(two_bits as u8, b)?;
+            let rank_b = self.qvs[level].rank(two_bits as u8, b)?;
 
             // Safety: we are sure the symbol `two_bits` is in [0..3]
-            b = rank_b + unsafe { qv.occs_smaller_unchecked(two_bits as u8) };
+            b = rank_b + unsafe { self.qvs[level].occs_smaller_unchecked(two_bits as u8) };
             shift -= 2;
 
-            rank_path_off.push(rank_b);
+            rank_path_off[level] = rank_b;
         }
 
         shift = 0;
@@ -1608,9 +1698,7 @@ where
             let rank_b = rank_path_off[level];
             let two_bits = (symbol >> shift as usize).as_() & 3;
 
-            // SAFETY: `level < n_levels == qvs.len()` by loop bound.
-            let qv = unsafe { self.qvs.get_unchecked(level) };
-            result = qv.select(two_bits as u8, rank_b + result)? - b;
+            result = self.qvs[level].select(two_bits as u8, rank_b + result)? - b;
             shift += 2;
         }
 
@@ -1694,7 +1782,7 @@ where
     where
         I: IntoIterator<Item = T>,
     {
-        QWaveletTree::new(&mut iter.into_iter().collect::<Vec<T>>())
+        QWaveletTree::from(iter.into_iter().collect::<Vec<T>>())
     }
 }
 
@@ -1705,8 +1793,8 @@ where
     usize: AsPrimitive<T>,
     RS: RSforWT,
 {
-    fn from(mut v: Vec<T>) -> Self {
-        QWaveletTree::new(&mut v[..])
+    fn from(v: Vec<T>) -> Self {
+        QWaveletTree::from_owned(v)
     }
 }
 

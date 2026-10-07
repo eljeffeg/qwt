@@ -1,9 +1,50 @@
+use super::{craft_wm_codes, LenInfo};
 use crate::perf_and_test_utils::{gen_sequence, TimingQueries};
 use crate::{
     AccessUnsigned, HuffQWaveletTree, OccsRangeUnsigned, RSQVector512, RankUnsigned,
     SelectUnsigned, HQWT256,
 };
 use rand::RngExt;
+
+#[test]
+fn overwide_huffman_lengths_are_limited_without_flattening_common_codes() {
+    // A complete quaternary tree with one internal child at each level: three
+    // leaves at depths 1..=16 and four leaves at depth 17. The old code would
+    // shift by 32 while constructing this valid 34-bit code set.
+    let mut lengths = Vec::new();
+    let mut symbol = 0;
+    for depth in 1..=16 {
+        for _ in 0..3 {
+            lengths.push(LenInfo(symbol, depth * 2, 1 << (17 - depth)));
+            symbol += 1;
+        }
+    }
+    for _ in 0..4 {
+        lengths.push(LenInfo(symbol, 34, 1));
+        symbol += 1;
+    }
+
+    let codes = craft_wm_codes(lengths, symbol - 1);
+    assert!(codes.iter().all(|code| code.len <= 32));
+    assert!(codes.iter().all(|code| code.len.is_multiple_of(2)));
+    assert!(codes.iter().any(|code| code.len == 2));
+
+    let occupied_slots = codes
+        .iter()
+        .map(|code| 1_u64 << (u32::BITS - code.len))
+        .sum::<u64>();
+    assert!(occupied_slots <= 1_u64 << u32::BITS);
+    for (left_index, left) in codes.iter().enumerate() {
+        for right in &codes[left_index + 1..] {
+            let (short, long) = if left.len <= right.len {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            assert_ne!(short.content, long.content >> (long.len - short.len));
+        }
+    }
+}
 
 #[test]
 fn test_small() {
@@ -273,6 +314,19 @@ fn test_serialize() {
     let des_qwt = bincode::deserialize::<HuffQWaveletTree<u8, RSQVector512>>(&s).unwrap();
 
     assert_eq!(des_qwt, qwt);
+}
+
+#[test]
+fn construction_is_deterministic_for_tied_frequencies() {
+    let sequence = (0u16..64).cycle().take(64 * 32).collect::<Vec<_>>();
+    let expected = HuffQWaveletTree::<_, RSQVector512>::from(sequence.clone());
+
+    for _ in 0..8 {
+        assert_eq!(
+            HuffQWaveletTree::<_, RSQVector512>::from(sequence.clone()),
+            expected
+        );
+    }
 }
 
 fn gen_seq(n: usize, sigma: usize) -> Vec<u64> {
