@@ -324,7 +324,6 @@ pub fn write_hqwt256_u32_direct(
         if let Some(bucket_writers) = buckets.as_mut() {
             for writer in bucket_writers {
                 writer.flush()?;
-                writer.get_ref().sync_all()?;
             }
         }
         drop(buckets);

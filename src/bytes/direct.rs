@@ -283,11 +283,10 @@ impl LevelEncoder {
             let sentinel = self.n_superblocks - 1;
             self.select[symbol].write_all(&sentinel.to_le_bytes())?;
             self.n_sel[symbol] += 1;
-            self.select[symbol].sync_all()?;
         }
+        // Level files are transient scratch: they are read back through the
+        // page cache and removed, so syncing them only costs a device flush.
         self.data.flush()?;
-        self.data.get_ref().sync_all()?;
-        self.superblocks.sync_all()?;
 
         let mut cumulative = [0u64; 5];
         for symbol in 0..4 {
@@ -506,7 +505,6 @@ pub fn write_qwt256_u32_direct(
         if let Some(bucket_writers) = buckets.as_mut() {
             for writer in bucket_writers {
                 writer.flush()?;
-                writer.get_ref().sync_all()?;
             }
         }
         drop(buckets);
