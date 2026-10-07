@@ -55,6 +55,22 @@ pub fn qwt256_u32_output_upper_bound(rows: u64, sigma: u32) -> Result<u64, Direc
     container_output_upper_bound(rows, levels, LEVEL_DIR_SIZE as u64, 0)
 }
 
+/// Conservative scratch ceiling for direct construction of a canonical
+/// QWT256/u32 `QWTB` section.
+///
+/// Container builders use this before starting a larger atomic build so a
+/// nested QWT cannot discover an insufficient scratch allowance after its
+/// surrounding representation has already been staged.
+pub fn qwt256_u32_scratch_upper_bound(rows: u64, sigma: u32) -> Result<u64, DirectQwtBuildError> {
+    validate_row_capacity(rows, "QWTB")?;
+    let levels = if rows == 0 {
+        0
+    } else {
+        ((u32::BITS - sigma.leading_zeros()).max(1).div_ceil(2)) as u16
+    };
+    scratch_upper_bound(rows, levels)
+}
+
 /// Failures specific to direct QWTB construction.
 #[derive(Debug)]
 pub enum DirectQwtBuildError {
@@ -392,7 +408,7 @@ pub fn write_qwt256_u32_direct(
     } else {
         ((u32::BITS - sigma.leading_zeros()).max(1).div_ceil(2)) as u16
     };
-    let scratch_required = scratch_upper_bound(rows, levels)?;
+    let scratch_required = qwt256_u32_scratch_upper_bound(rows, sigma)?;
     if scratch_required > budget.scratch_bytes {
         return Err(DirectQwtBuildError::ScratchBudget {
             required: scratch_required,
@@ -937,6 +953,53 @@ mod tests {
         assert!(matches!(error, DirectQwtBuildError::ScratchBudget { .. }));
         assert!(!output.exists());
         assert!(!scratch.exists() || std::fs::read_dir(&scratch).unwrap().next().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn public_scratch_upper_bound_matches_enforced_requirement() {
+        let values: Vec<u32> = (0..10_000).map(|row| (row % 257) as u32).collect();
+        let rows = values.len() as u64;
+        let sigma = 256;
+        let required = qwt256_u32_scratch_upper_bound(rows, sigma).unwrap();
+        assert_eq!(qwt256_u32_scratch_upper_bound(0, sigma).unwrap(), 0);
+        let dir = test_dir("public-scratch-bound");
+        let source = dir.join("source.u32");
+        let output = dir.join("output.qwtb");
+        let scratch = dir.join("scratch");
+        write_source(&source, &values);
+        let error = write_qwt256_u32_direct(
+            &source,
+            rows,
+            sigma,
+            &output,
+            &scratch,
+            DirectQwtBuildBudget {
+                buffer_bytes: budget(rows).buffer_bytes,
+                scratch_bytes: required - 1,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DirectQwtBuildError::ScratchBudget { required: r, .. } if r == required
+        ));
+        write_qwt256_u32_direct(
+            &source,
+            rows,
+            sigma,
+            &output,
+            &scratch,
+            DirectQwtBuildBudget {
+                buffer_bytes: budget(rows).buffer_bytes,
+                scratch_bytes: required,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            qwt256_to_bytes(&QWT256::from(values)).unwrap()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
