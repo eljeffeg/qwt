@@ -5,6 +5,25 @@
 <a href="LICENSE"><img src="https://badgen.net/static/license/MIT/blue" /></a>
 </p>
 
+> **`integration` branch of eljeffeg/qwt.** This branch combines every open pull request against [rossanoventurini/qwt](https://github.com/rossanoventurini/qwt), so the work can be used as one tree before the PRs merge upstream:
+> [#31](https://github.com/rossanoventurini/qwt/pull/31) range-successor queries and fused 4-symbol rank ·
+> [#32](https://github.com/rossanoventurini/qwt/pull/32) byte layout and zero-copy I/O ·
+> [#33](https://github.com/rossanoventurini/qwt/pull/33) elided per-level bounds checks ·
+> [#34](https://github.com/rossanoventurini/qwt/pull/34) `extract_range` / `extract_range_distinct` ·
+> [#35](https://github.com/rossanoventurini/qwt/pull/35) unchecked-rank symbol validation ·
+> [#36](https://github.com/rossanoventurini/qwt/pull/36) QVector deserialization invariants ·
+> [#37](https://github.com/rossanoventurini/qwt/pull/37) reused partition buffers ·
+> [#38](https://github.com/rossanoventurini/qwt/pull/38) allocation-free select ·
+> [#39](https://github.com/rossanoventurini/qwt/pull/39) bounded direct QWTB/HQWB builders ·
+> [#40](https://github.com/rossanoventurini/qwt/pull/40) hardened deserialization invariants ·
+> [#41](https://github.com/rossanoventurini/qwt/pull/41) hardened QWTB/HQWB decoding ·
+> [#42](https://github.com/rossanoventurini/qwt/pull/42) runtime POPCNT dispatch ·
+> [#43](https://github.com/rossanoventurini/qwt/pull/43) select validation and Bincode pin ·
+> [#44](https://github.com/rossanoventurini/qwt/pull/44) select cursor for borrowed views ·
+> [#45](https://github.com/rossanoventurini/qwt/pull/45) native-lane `DataLine::get`.
+>
+> `main` tracks upstream. This branch is rebuilt whenever the PRs change.
+
 The [wavelet tree](https://en.wikipedia.org/wiki/Wavelet_Tree) [[1](#bib)] is a compact data structure that for a sequence $S$ of length $n$ over an alphabet of size $\sigma$ requires only $n\lceil\log \sigma \rceil (1+o(1))$ bits of space and can answer *rank* and *select* queries in $\Theta(\log \sigma)$ time.
 
 A rank query counts the number of occurrences of a symbol up to a given position in the sequence. A select query finds the position in the sequence of a symbol with a given rank. These queries have applications in, e.g., compression, computational geometry, and pattern matching in the form of the backward search---the backbone of many compressed full-text indices.

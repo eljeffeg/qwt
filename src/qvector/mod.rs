@@ -86,7 +86,7 @@ impl AccessQuad for DataLine {
             // little-endian `[u128; 4]` representation.
             let word_high = unsafe { *words.add(lane) };
             let word_low = unsafe { *words.add(lane + 4) };
-            return (((word_high >> shift) & 1) << 1 | (word_low >> shift) & 1) as u8;
+            (((word_high >> shift) & 1) << 1 | (word_low >> shift) & 1) as u8
         }
 
         #[cfg(target_endian = "big")]

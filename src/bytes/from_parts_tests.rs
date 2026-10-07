@@ -37,6 +37,16 @@ fn rsqvector_from_parts_eq() {
     assert_eq!(original, rebuilt);
 }
 
+#[test]
+fn superblock_public_accessors_reject_invalid_symbols_and_blocks() {
+    let superblock = SuperblockPlain::from_counters([0; 4]);
+    assert!(std::panic::catch_unwind(|| superblock.get_rank(4, 0)).is_err());
+    assert!(std::panic::catch_unwind(|| superblock.get_rank(0, 8)).is_err());
+    assert!(std::panic::catch_unwind(|| superblock.get_rank_all(8)).is_err());
+    assert!(std::panic::catch_unwind(|| superblock.get_superblock_counter(4)).is_err());
+    assert!(std::panic::catch_unwind(|| superblock.block_predecessor(4, 0)).is_err());
+}
+
 fn clone_hqwt_levels(original: &HQWT256<u32>) -> Vec<RSQVector256> {
     original
         .levels()

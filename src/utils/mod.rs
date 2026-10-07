@@ -184,8 +184,6 @@ pub fn popcnt_wide<const N: usize>(data: &[u64]) -> usize {
 }
 
 use crate::quadwt::huffqwt::PrefixCode;
-use std::mem;
-
 /// Returns a vector with at least the given capacity when `T` itself has
 /// 64-byte alignment.
 ///
