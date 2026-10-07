@@ -62,7 +62,9 @@ pub const FLAG_PREFETCH: u8 = 0b0000_0010;
 #[cfg(test)]
 mod from_parts_tests;
 pub use direct::{
-    qwt256_u32_output_upper_bound, write_qwt256_u32_direct, DirectQwtBuildBudget,
-    DirectQwtBuildError, DirectQwtBuildStats,
+    qwt256_u32_output_upper_bound, qwt256_u32_scratch_upper_bound, write_qwt256_u32_direct,
+    DirectQwtBuildBudget, DirectQwtBuildError, DirectQwtBuildStats,
 };
-pub use direct_huff::{hqwt256_u32_output_upper_bound, write_hqwt256_u32_direct};
+pub use direct_huff::{
+    hqwt256_u32_min_buffer_bytes, hqwt256_u32_output_upper_bound, write_hqwt256_u32_direct,
+};

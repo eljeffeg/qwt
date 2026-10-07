@@ -23,6 +23,25 @@ const MIN_STREAM_BUFFER_BYTES: u64 = 4 * 1_024;
 const HUFF_METADATA_BYTES_PER_SYMBOL: u64 = 128;
 const HUFF_METADATA_FIXED_BYTES: u64 = 4 * 1_024;
 
+/// Minimum heap-buffer allowance required by the direct Huffman QWT writer
+/// for an alphabet of `alphabet_size` symbols.
+pub fn hqwt256_u32_min_buffer_bytes(alphabet_size: u32) -> Result<u64, DirectQwtBuildError> {
+    let metadata_bytes = u64::from(alphabet_size)
+        .checked_mul(HUFF_METADATA_BYTES_PER_SYMBOL)
+        .and_then(|bytes| bytes.checked_add(HUFF_METADATA_FIXED_BYTES))
+        .ok_or(DirectQwtBuildError::Overflow(
+            "Huffman metadata buffer bytes",
+        ))?;
+    let stream_bytes = DIRECT_HUFF_STREAMS
+        .checked_mul(MIN_STREAM_BUFFER_BYTES)
+        .ok_or(DirectQwtBuildError::Overflow("minimum stream buffer bytes"))?;
+    metadata_bytes
+        .checked_add(stream_bytes)
+        .ok_or(DirectQwtBuildError::Overflow(
+            "minimum Huffman buffer bytes",
+        ))
+}
+
 /// Conservative byte ceiling for the final canonical HQWB output.
 ///
 /// This deliberately assumes the maximum 16 quad levels permitted by the
@@ -101,15 +120,7 @@ pub fn write_hqwt256_u32_direct(
         .ok_or(DirectQwtBuildError::Overflow(
             "Huffman metadata buffer bytes",
         ))?;
-    let stream_bytes = DIRECT_HUFF_STREAMS
-        .checked_mul(MIN_STREAM_BUFFER_BYTES)
-        .ok_or(DirectQwtBuildError::Overflow("minimum stream buffer bytes"))?;
-    let required_buffers =
-        metadata_bytes
-            .checked_add(stream_bytes)
-            .ok_or(DirectQwtBuildError::Overflow(
-                "minimum Huffman buffer bytes",
-            ))?;
+    let required_buffers = hqwt256_u32_min_buffer_bytes(alphabet_size)?;
     if budget.buffer_bytes < required_buffers {
         return Err(DirectQwtBuildError::BufferBudget {
             required: required_buffers,
@@ -650,6 +661,7 @@ mod tests {
         let required_buffer = HUFF_METADATA_FIXED_BYTES
             + 5 * HUFF_METADATA_BYTES_PER_SYMBOL
             + DIRECT_HUFF_STREAMS * MIN_STREAM_BUFFER_BYTES;
+        assert_eq!(hqwt256_u32_min_buffer_bytes(5).unwrap(), required_buffer);
         let buffer_error = write_hqwt256_u32_direct(
             &source,
             values.len() as u64,
@@ -664,7 +676,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             buffer_error,
-            DirectQwtBuildError::BufferBudget { .. }
+            DirectQwtBuildError::BufferBudget { required, .. } if required == required_buffer
         ));
         let scratch_error = write_hqwt256_u32_direct(
             &source,
