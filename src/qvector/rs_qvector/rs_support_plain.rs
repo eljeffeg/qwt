@@ -254,6 +254,7 @@ impl<const B_SIZE: usize> RSSupportPlain<B_SIZE> {
 ///
 /// POD layout for zero-copy I/O; fields are crate-private (Group B).
 #[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, MemSize, MemDbg, PartialEq)]
+#[mem_size(flat)]
 #[repr(C, align(64))]
 pub struct SuperblockPlain {
     pub(crate) counters: [u128; 4],

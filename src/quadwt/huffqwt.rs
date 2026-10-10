@@ -16,6 +16,7 @@ use std::ops::{Bound, Range, RangeBounds};
 use std::vec;
 
 #[derive(Default, Clone, PartialEq, Serialize, Deserialize, MemDbg, MemSize, Debug)]
+#[mem_size(flat)]
 pub struct PrefixCode {
     pub content: u32,
     pub len: u32,

@@ -20,6 +20,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// One cache-line of 256 two-bit symbols (512 bits).
 /// POD layout for zero-copy I/O; fields are crate-private (Group B).
 #[derive(Copy, Clone, Default, Eq, PartialEq, Serialize, MemSize, MemDbg, Deserialize, Debug)]
+#[mem_size(flat)]
 #[repr(C, align(64))]
 pub struct DataLine {
     pub(crate) words: [u128; 4],
