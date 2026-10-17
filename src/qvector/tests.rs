@@ -121,6 +121,16 @@ fn data_line_access_crosses_native_lane_boundaries() {
 }
 
 #[test]
+fn superblock_public_accessors_reject_invalid_symbols_and_blocks() {
+    let superblock = crate::SuperblockPlain::default();
+    assert!(std::panic::catch_unwind(|| superblock.get_rank(4, 0)).is_err());
+    assert!(std::panic::catch_unwind(|| superblock.get_rank(0, 8)).is_err());
+    assert!(std::panic::catch_unwind(|| superblock.get_rank_all(8)).is_err());
+    assert!(std::panic::catch_unwind(|| superblock.get_superblock_counter(4)).is_err());
+    assert!(std::panic::catch_unwind(|| superblock.block_predecessor(4, 0)).is_err());
+}
+
+#[test]
 fn data_line_rank_all_matches_scalar_rank() {
     let mut data_line = DataLine::default();
     for position in 0..=255u8 {
