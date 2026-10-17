@@ -526,14 +526,17 @@ where
             return None;
         }
 
-        let mut path_off = Vec::with_capacity(self.n_levels);
-        let mut rank_path_off = Vec::with_capacity(self.n_levels);
+        if self.n_levels > MAX_QUAD_LEVELS {
+            return None;
+        }
+        let mut path_off = [0usize; MAX_QUAD_LEVELS];
+        let mut rank_path_off = [0usize; MAX_QUAD_LEVELS];
 
         let mut b = 0usize;
         let mut shift: i64 = 2 * (self.n_levels - 1) as i64;
 
         for level in 0..self.n_levels {
-            path_off.push(b);
+            path_off[level] = b;
             let two_bits = (symbol >> shift as usize).as_() & 3;
             let lv = &self.levels[level];
             if b > lv.len() {
@@ -542,7 +545,7 @@ where
             let rank_b = unsafe { lv.rank_unchecked(two_bits as u8, b) };
             b = rank_b + unsafe { lv.occs_smaller_unchecked(two_bits as u8) };
             shift -= 2;
-            rank_path_off.push(rank_b);
+            rank_path_off[level] = rank_b;
         }
 
         shift = 0;
@@ -994,8 +997,11 @@ where
             return None;
         }
 
-        let mut path_off = Vec::with_capacity(self.n_levels);
-        let mut rank_path_off = Vec::with_capacity(self.n_levels);
+        if self.n_levels > MAX_QUAD_LEVELS {
+            return None;
+        }
+        let mut path_off = [0usize; MAX_QUAD_LEVELS];
+        let mut rank_path_off = [0usize; MAX_QUAD_LEVELS];
 
         let code = &self.codes_encode[symbol.as_()];
         let mut shift: i64 = code.len as i64 - 2;
@@ -1004,7 +1010,7 @@ where
         let mut level = 0usize;
 
         while shift >= 0 {
-            path_off.push(b);
+            path_off[level] = b;
             let two_bits = ((repr >> shift as usize) & 3) as u8;
             let lv = &self.levels[level];
             if b > lv.len() {
@@ -1012,7 +1018,7 @@ where
             }
             let rank_b = unsafe { lv.rank_unchecked(two_bits, b) };
             b = rank_b + unsafe { lv.occs_smaller_unchecked(two_bits) };
-            rank_path_off.push(rank_b);
+            rank_path_off[level] = rank_b;
             level += 1;
             shift -= 2;
         }
