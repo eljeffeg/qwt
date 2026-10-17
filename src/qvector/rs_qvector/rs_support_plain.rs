@@ -247,7 +247,12 @@ impl SuperblockPlain {
 
     #[inline(always)]
     pub fn get_rank(&self, symbol: u8, block_id: usize) -> usize {
-        let data = unsafe { *self.counters.get_unchecked(symbol as usize) };
+        assert!(symbol < 4, "symbols are in [0, 3]");
+        assert!(
+            block_id < Self::BLOCKS_IN_SUPERBLOCK,
+            "block id is in [0, 7]"
+        );
+        let data = self.counters[symbol as usize];
         let sb = (data >> 84) as usize;
 
         // We avoid a branch here. We want b be 0 if block_id is 0, real counter extracted from data otherwise
@@ -262,14 +267,18 @@ impl SuperblockPlain {
     /// Fused 4-symbol block ranks (loads one superblock once).
     #[inline(always)]
     pub fn get_rank_all(&self, block_id: usize) -> [usize; 4] {
+        assert!(
+            block_id < Self::BLOCKS_IN_SUPERBLOCK,
+            "block id is in [0, 7]"
+        );
         let not_first = (block_id > 0) as usize;
         let shift = (block_id - not_first) * 12;
         let mut out = [0usize; 4];
-        for symbol in 0..4 {
-            let data = unsafe { *self.counters.get_unchecked(symbol) };
+        for (symbol, slot) in out.iter_mut().enumerate() {
+            let data = self.counters[symbol];
             let sb = (data >> 84) as usize;
             let b = ((data >> shift) as usize & 0b111111111111) * not_first;
-            out[symbol] = sb + b;
+            *slot = sb + b;
         }
         out
     }
@@ -278,7 +287,8 @@ impl SuperblockPlain {
     /// Exposed for zero-copy / mmap flatten.
     #[inline(always)]
     pub fn get_superblock_counter(&self, symbol: u8) -> usize {
-        (unsafe { *self.counters.get_unchecked(symbol as usize) } >> 84) as usize
+        assert!(symbol < 4, "symbols are in [0, 3]");
+        (self.counters[symbol as usize] >> 84) as usize
     }
 
     fn set_block_counters(&mut self, block_id: usize, counters: &[usize; 4]) {
@@ -314,6 +324,7 @@ impl SuperblockPlain {
     /// predecessor x of a 12bit value in the last 84 bits of a u128.
     #[inline(always)]
     pub fn block_predecessor(&self, symbol: u8, target: usize) -> (usize, usize) {
+        assert!(symbol < 4, "symbols are in [0, 3]");
         let mut cnt = self.counters[symbol as usize];
         let mut prev_cnt = 0;
 
