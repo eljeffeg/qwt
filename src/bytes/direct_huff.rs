@@ -7,15 +7,15 @@
 
 use super::direct::{
     align_output, append_file, container_output_upper_bound, file_len, remove_level_files,
-    validate_row_capacity, DirectBuffers, DirectQwtBuildBudget, DirectQwtBuildError,
-    DirectQwtBuildStats, DirectWorkspace, LevelEncoder, LevelFiles, OutputGuard, SourceSet,
-    DIRECT_BLOCK_ROWS, DIRECT_SELECT_SAMPLE_ROWS, DIRECT_SUPERBLOCK_ROWS,
+    validate_row_capacity, write_bucket_runs, BlockScratch, DirectBuffers, DirectQwtBuildBudget,
+    DirectQwtBuildError, DirectQwtBuildStats, DirectWorkspace, LevelEncoder, LevelFiles,
+    OutputGuard, SourceSet, DIRECT_BLOCK_ROWS, DIRECT_SELECT_SAMPLE_ROWS, DIRECT_SUPERBLOCK_ROWS,
 };
 use super::hqwb::LevelDir;
 use super::{align_up, ensure_le, FORMAT_VERSION, HEADER_SIZE, HQWB_MAGIC, HQWT_LEVEL_DIR_SIZE};
 use crate::quadwt::huffqwt::{huffman_codes_from_frequencies, PrefixCode};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const DIRECT_HUFF_STREAMS: u64 = 7;
@@ -131,23 +131,27 @@ pub fn write_hqwt256_u32_direct(
     let alphabet_len = usize::try_from(alphabet_size)
         .map_err(|_| DirectQwtBuildError::Overflow("Huffman alphabet size"))?;
     let mut frequencies = vec![0usize; alphabet_len];
+    let mut blocks = BlockScratch::new(per_stream_buffer, 2);
     if rows != 0 {
-        let file = File::open(source)?;
-        let mut reader = BufReader::with_capacity(per_stream_buffer, file);
-        for _ in 0..rows {
-            let symbol = read_symbol(&mut reader)?;
-            let frequency =
-                frequencies
-                    .get_mut(symbol as usize)
-                    .ok_or(DirectQwtBuildError::InvalidInput(
-                        "source symbol exceeds local alphabet",
-                    ))?;
-            *frequency = frequency
-                .checked_add(1)
-                .ok_or(DirectQwtBuildError::Overflow("Huffman symbol frequency"))?;
+        let mut file = File::open(source)?;
+        let mut remaining = rows;
+        while remaining > 0 {
+            let block = remaining.min(blocks.rows() as u64) as usize;
+            let symbols = &mut blocks.symbols[..block * 4];
+            file.read_exact(symbols)?;
+            remaining -= block as u64;
+            for encoded in symbols.chunks_exact(4) {
+                let symbol = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+                let frequency = frequencies.get_mut(symbol as usize).ok_or(
+                    DirectQwtBuildError::InvalidInput("source symbol exceeds local alphabet"),
+                )?;
+                *frequency = frequency
+                    .checked_add(1)
+                    .ok_or(DirectQwtBuildError::Overflow("Huffman symbol frequency"))?;
+            }
         }
         let mut trailing = [0u8; 1];
-        if reader.read(&mut trailing)? != 0 {
+        if file.read(&mut trailing)? != 0 {
             return Err(DirectQwtBuildError::InvalidInput(
                 "source contains trailing rows",
             ));
@@ -291,37 +295,46 @@ pub fn write_hqwt256_u32_direct(
         let mut seen = 0u64;
         let mut level_rows = 0u64;
         for path in &current.paths {
-            let file = File::open(path)?;
+            let mut file = File::open(path)?;
             let path_bytes = file.metadata()?.len();
             if !path_bytes.is_multiple_of(4) {
                 return Err(DirectQwtBuildError::InvalidInput(
                     "partition source contains a partial symbol",
                 ));
             }
-            let path_rows = path_bytes / 4;
-            let mut reader = BufReader::with_capacity(per_stream_buffer, file);
-            for _ in 0..path_rows {
-                let encoded = read_encoded_symbol(&mut reader)?;
-                let symbol = u32::from_le_bytes(encoded);
-                let code = codes
-                    .get(symbol as usize)
-                    .ok_or(DirectQwtBuildError::InvalidInput(
-                        "partition symbol exceeds local alphabet",
-                    ))?;
-                if code.len >= shift {
-                    let digit = ((code.content >> (code.len - shift)) & 3) as u8;
-                    encoder.push(digit, level_rows)?;
-                    level_rows += 1;
-                }
-                if let Some(bucket_writers) = buckets.as_mut() {
-                    let bucket = if code.len <= shift {
-                        4
+            let mut remaining = path_bytes / 4;
+            while remaining > 0 {
+                let block = remaining.min(blocks.rows() as u64) as usize;
+                let symbols = &mut blocks.symbols[..block * 4];
+                file.read_exact(symbols)?;
+                remaining -= block as u64;
+                let ids = &mut blocks.buckets[..block];
+                let digits = &mut blocks.digits[..block];
+                let mut staged = 0;
+                for (id, encoded) in ids.iter_mut().zip(symbols.chunks_exact(4)) {
+                    let symbol =
+                        u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+                    let code =
+                        codes
+                            .get(symbol as usize)
+                            .ok_or(DirectQwtBuildError::InvalidInput(
+                                "partition symbol exceeds local alphabet",
+                            ))?;
+                    let digit = if code.len >= shift {
+                        ((code.content >> (code.len - shift)) & 3) as u8
                     } else {
-                        ((code.content >> (code.len - shift)) & 3) as usize
+                        0
                     };
-                    bucket_writers[bucket].write_all(&encoded)?;
+                    digits[staged] = digit;
+                    staged += usize::from(code.len >= shift);
+                    *id = if code.len <= shift { 4 } else { digit };
                 }
-                seen += 1;
+                encoder.push_block(&digits[..staged], level_rows)?;
+                level_rows += staged as u64;
+                if let Some(bucket_writers) = buckets.as_mut() {
+                    write_bucket_runs(bucket_writers, ids, symbols)?;
+                }
+                seen += block as u64;
             }
         }
         if seen != rows {
@@ -416,16 +429,6 @@ pub fn write_hqwt256_u32_direct(
         output_bytes: cursor,
         peak_scratch_bytes: peak_scratch,
     })
-}
-
-fn read_symbol(reader: &mut impl Read) -> Result<u32, DirectQwtBuildError> {
-    Ok(u32::from_le_bytes(read_encoded_symbol(reader)?))
-}
-
-fn read_encoded_symbol(reader: &mut impl Read) -> Result<[u8; 4], DirectQwtBuildError> {
-    let mut encoded = [0u8; 4];
-    reader.read_exact(&mut encoded)?;
-    Ok(encoded)
 }
 
 fn scratch_upper_bound(rows: u64, levels: u16) -> Result<u64, DirectQwtBuildError> {
@@ -738,5 +741,51 @@ mod tests {
         assert!(!output.exists());
         assert!(!scratch.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_bytes_when_source_is_not_a_block_multiple() {
+        // The minimum budget stages 512 rows per block with two byte lanes.
+        for rows in [1usize, 511, 512, 513, 1_023, 1_025, 5_000] {
+            let mut values = skewed_values(rows as u64, 40);
+            values.truncate(rows.max(40));
+            let minimum = hqwt256_u32_min_buffer_bytes(40).unwrap();
+            assert_exact_with_buffer(&format!("partial-block-{rows}"), values, minimum);
+        }
+    }
+
+    #[test]
+    fn rejects_symbols_outside_the_alphabet_at_any_block_position() {
+        let rows = 2_000usize;
+        for bad_row in [0usize, 255, 511, 512, 1_023, 1_999] {
+            let mut values: Vec<u32> = (0..rows).map(|row| (row % 20) as u32).collect();
+            values[bad_row] = 20;
+            let root = test_dir("alphabet-error");
+            let source = root.join("source.u32");
+            let output = root.join("output.hqwb");
+            let scratch = root.join("scratch");
+            write_source(&source, &values);
+            let error = write_hqwt256_u32_direct(
+                &source,
+                rows as u64,
+                20,
+                &output,
+                &scratch,
+                DirectQwtBuildBudget {
+                    buffer_bytes: hqwt256_u32_min_buffer_bytes(20).unwrap(),
+                    scratch_bytes: 1 << 24,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    DirectQwtBuildError::InvalidInput("source symbol exceeds local alphabet")
+                ),
+                "row {bad_row}: {error}"
+            );
+            assert!(!output.exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
