@@ -9,13 +9,17 @@ use super::qwtb::LevelDir;
 use super::{align_up, ensure_le, FORMAT_VERSION, HEADER_SIZE, LEVEL_DIR_SIZE, QWTB_MAGIC};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) const DIRECT_BLOCK_ROWS: u64 = 256;
 pub(super) const DIRECT_SUPERBLOCK_ROWS: u64 = 2_048;
 pub(super) const DIRECT_SELECT_SAMPLE_ROWS: u64 = 8_192;
+const PIECE_ROWS: u64 = 64;
+/// Staged rows per input block, bounded so a block stays cache-resident even
+/// when the budget would allow megabytes.
+const MAX_BLOCK_ROWS: usize = 16_384;
 const DIRECT_STREAMS: u64 = 6;
 const MIN_STREAM_BUFFER_BYTES: u64 = 3 * 1_024;
 const MIN_AUX_BUFFER_BYTES: u64 = 4 * 1_024;
@@ -170,6 +174,56 @@ impl SourceSet {
     }
 }
 
+/// Block staging for the input stream of one direct level pass.
+///
+/// The three arrays together occupy exactly the per-stream buffer that a
+/// `BufReader` over the source would have used: `4 + lanes` bytes per staged
+/// row (raw little-endian symbols plus one byte per lane).
+pub(super) struct BlockScratch {
+    pub(super) symbols: Vec<u8>,
+    pub(super) digits: Vec<u8>,
+    pub(super) buckets: Vec<u8>,
+}
+
+impl BlockScratch {
+    /// `lanes` is 1 when only digits are staged and 2 when per-row bucket
+    /// ids are staged as well.
+    pub(super) fn new(stream_bytes: usize, lanes: usize) -> Self {
+        let rows = (stream_bytes / (4 + lanes)).clamp(1, MAX_BLOCK_ROWS);
+        Self {
+            symbols: vec![0; rows * 4],
+            digits: vec![0; rows],
+            buckets: vec![0; if lanes > 1 { rows } else { 0 }],
+        }
+    }
+
+    pub(super) fn rows(&self) -> usize {
+        self.digits.len()
+    }
+}
+
+/// Writes each row of `symbols` to the bucket named by its id, one write per
+/// run of equal ids. `ids[i]` selects the writer for the four bytes at
+/// `symbols[4 * i..]`.
+pub(super) fn write_bucket_runs(
+    writers: &mut [BufWriter<File>],
+    ids: &[u8],
+    symbols: &[u8],
+) -> io::Result<()> {
+    debug_assert_eq!(ids.len() * 4, symbols.len());
+    let mut start = 0;
+    while start < ids.len() {
+        let id = ids[start];
+        let mut end = start + 1;
+        while end < ids.len() && ids[end] == id {
+            end += 1;
+        }
+        writers[usize::from(id)].write_all(&symbols[start * 4..end * 4])?;
+        start = end;
+    }
+    Ok(())
+}
+
 /// Heap-buffer split for one direct build.
 ///
 /// The main streams (input, partition outputs, packed level data) share the
@@ -273,6 +327,9 @@ impl LevelEncoder {
         })
     }
 
+    /// Appends one digit at absolute `row`. Rows must arrive sequentially from
+    /// zero; `push_block` is the production path and this is its scalar oracle.
+    #[cfg(test)]
     pub(super) fn push(&mut self, digit: u8, row: u64) -> Result<(), DirectQwtBuildError> {
         if row > 0 && row.is_multiple_of(DIRECT_SUPERBLOCK_ROWS) {
             self.flush_superblock()?;
@@ -307,6 +364,93 @@ impl LevelEncoder {
         self.words[high_word] |= u128::from(digit >> 1) << shift;
         self.words[low_word] |= u128::from(digit & 1) << shift;
         self.line_rows += 1;
+        if self.line_rows == DIRECT_BLOCK_ROWS as u16 {
+            self.flush_line()?;
+        }
+        Ok(())
+    }
+
+    /// Appends `digits` (each in `0..4`) starting at absolute `start_row`.
+    ///
+    /// Produces exactly the bytes of calling `push` once per digit. Digits are
+    /// processed in pieces that never cross a 64-row boundary, so every piece
+    /// lies inside one rank block, superblock, data-line word, and select
+    /// sample interval. Each piece is transposed into two bit planes whose
+    /// popcounts give the per-symbol counts without per-digit branching.
+    pub(super) fn push_block(
+        &mut self,
+        digits: &[u8],
+        start_row: u64,
+    ) -> Result<(), DirectQwtBuildError> {
+        let mut row = start_row;
+        let mut rest = digits;
+        while !rest.is_empty() {
+            let take = rest.len().min((PIECE_ROWS - row % PIECE_ROWS) as usize);
+            let (piece, tail) = rest.split_at(take);
+            self.push_piece(piece, row)?;
+            row += take as u64;
+            rest = tail;
+        }
+        Ok(())
+    }
+
+    fn push_piece(&mut self, piece: &[u8], row: u64) -> Result<(), DirectQwtBuildError> {
+        debug_assert!(!piece.is_empty() && piece.len() as u64 <= PIECE_ROWS - row % PIECE_ROWS);
+        debug_assert_eq!(u64::from(self.line_rows), row % DIRECT_BLOCK_ROWS);
+        if row > 0 && row.is_multiple_of(DIRECT_SUPERBLOCK_ROWS) {
+            self.flush_superblock()?;
+            self.superblock_words =
+                std::array::from_fn(|symbol| (self.global[symbol] as u128) << 84);
+            self.block = [0; 4];
+            self.n_superblocks = self
+                .n_superblocks
+                .checked_add(1)
+                .ok_or(DirectQwtBuildError::Overflow("superblock count"))?;
+        }
+        if row.is_multiple_of(DIRECT_BLOCK_ROWS) {
+            self.set_block_counters(((row / DIRECT_BLOCK_ROWS) % 8) as usize)?;
+        }
+
+        let mut high = 0u64;
+        let mut low = 0u64;
+        for (index, &digit) in piece.iter().enumerate() {
+            debug_assert!(digit < 4);
+            high |= u64::from((digit >> 1) & 1) << index;
+            low |= u64::from(digit & 1) << index;
+        }
+        let rows = piece.len() as u64;
+        let c3 = u64::from((high & low).count_ones());
+        let c2 = u64::from((high & !low).count_ones());
+        let c1 = u64::from((!high & low).count_ones());
+        let counts = [rows - c1 - c2 - c3, c1, c2, c3];
+
+        // A piece holds at most 64 rows, so each symbol crosses at most one
+        // select-sample threshold, and every row shares one superblock id.
+        for (symbol, &count) in counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let first = self.global[symbol];
+            if (first + count - 1) / DIRECT_SELECT_SAMPLE_ROWS
+                != first.wrapping_sub(1) / DIRECT_SELECT_SAMPLE_ROWS
+            {
+                let superblock = u32::try_from(row / DIRECT_SUPERBLOCK_ROWS)
+                    .map_err(|_| DirectQwtBuildError::Overflow("select superblock id"))?;
+                self.select[symbol].write_all(&superblock.to_le_bytes())?;
+                self.n_sel[symbol] = self.n_sel[symbol]
+                    .checked_add(1)
+                    .ok_or(DirectQwtBuildError::Overflow("select sample count"))?;
+            }
+            self.global[symbol] = first + count;
+            self.block[symbol] += count;
+        }
+
+        let line_pos = self.line_rows;
+        let high_word = usize::from(line_pos >> 7);
+        let shift = line_pos & 127;
+        self.words[high_word] |= u128::from(high) << shift;
+        self.words[high_word + 2] |= u128::from(low) << shift;
+        self.line_rows += piece.len() as u16;
         if self.line_rows == DIRECT_BLOCK_ROWS as u16 {
             self.flush_line()?;
         }
@@ -498,6 +642,7 @@ pub fn write_qwt256_u32_direct(
         .map_err(|_| DirectQwtBuildError::Overflow("copy buffer bytes"))?;
     let mut peak_scratch = if levels == 0 { 0 } else { source_bytes };
     let mut actual_sigma = 0u32;
+    let mut blocks = BlockScratch::new(per_stream_buffer, 1);
 
     for level in 0..levels {
         let shift = 2 * (usize::from(levels - level - 1));
@@ -531,27 +676,35 @@ pub fn write_qwt256_u32_direct(
         };
         let mut seen = 0u64;
         for path in &current.paths {
-            let file = File::open(path)?;
+            let mut file = File::open(path)?;
             let path_rows = file.metadata()?.len() / 4;
-            let mut reader = BufReader::with_capacity(per_stream_buffer, file);
-            for _ in 0..path_rows {
-                let mut encoded = [0u8; 4];
-                reader.read_exact(&mut encoded)?;
-                let symbol = u32::from_le_bytes(encoded);
-                if symbol > sigma {
+            let mut remaining = path_rows;
+            while remaining > 0 {
+                let block = remaining.min(blocks.rows() as u64) as usize;
+                let symbols = &mut blocks.symbols[..block * 4];
+                file.read_exact(symbols)?;
+                remaining -= block as u64;
+                let digits = &mut blocks.digits[..block];
+                let mut block_max = 0u32;
+                for (digit, encoded) in digits.iter_mut().zip(symbols.chunks_exact(4)) {
+                    let symbol =
+                        u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+                    block_max = block_max.max(symbol);
+                    *digit = ((symbol >> shift) & 3) as u8;
+                }
+                if block_max > sigma {
                     return Err(DirectQwtBuildError::InvalidInput(
                         "source symbol exceeds declared sigma",
                     ));
                 }
                 if level == 0 {
-                    actual_sigma = actual_sigma.max(symbol);
+                    actual_sigma = actual_sigma.max(block_max);
                 }
-                let digit = ((symbol >> shift) & 3) as u8;
-                encoder.push(digit, seen)?;
+                encoder.push_block(digits, seen)?;
                 if let Some(bucket_writers) = buckets.as_mut() {
-                    bucket_writers[usize::from(digit)].write_all(&encoded)?;
+                    write_bucket_runs(bucket_writers, digits, symbols)?;
                 }
-                seen += 1;
+                seen += block as u64;
             }
         }
         if seen != rows {
@@ -1158,6 +1311,240 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, DirectQwtBuildError::InvalidInput(_)));
         assert!(!dir.join("output.qwtb").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn level_files(dir: &Path) -> LevelFiles {
+        std::fs::create_dir_all(dir).unwrap();
+        LevelFiles {
+            data: dir.join("data.bin"),
+            superblocks: dir.join("superblocks.bin"),
+            select: std::array::from_fn(|symbol| dir.join(format!("select-{symbol}.bin"))),
+        }
+    }
+
+    fn level_bytes(files: &LevelFiles) -> Vec<Vec<u8>> {
+        [&files.data, &files.superblocks]
+            .into_iter()
+            .chain(&files.select)
+            .map(|path| std::fs::read(path).unwrap())
+            .collect()
+    }
+
+    fn digit_stream(rows: usize, kind: &str, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..rows)
+            .map(|row| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let draw = (state >> 20) % 100;
+                match kind {
+                    "uniform" => (state >> 33) as u8 & 3,
+                    "skewed" => match draw {
+                        0..=93 => 0,
+                        94..=96 => 1,
+                        97 => 2,
+                        _ => 3,
+                    },
+                    "runs" => ((row / 97) % 4) as u8,
+                    _ => 2,
+                }
+            })
+            .collect()
+    }
+
+    fn assert_batch_matches_scalar(name: &str, digits: &[u8], chunks: &[usize]) {
+        let dir = test_dir(name);
+        let buffers = DirectBuffers::plan(min_buffer_bytes(), DIRECT_STREAMS).unwrap();
+        let scalar_files = level_files(&dir.join("scalar"));
+        let batch_files = level_files(&dir.join("batch"));
+
+        let mut scalar = LevelEncoder::new(&scalar_files, buffers).unwrap();
+        for (row, &digit) in digits.iter().enumerate() {
+            scalar.push(digit, row as u64).unwrap();
+        }
+        let scalar = scalar.finish(digits.len() as u64, &scalar_files).unwrap();
+
+        let mut batch = LevelEncoder::new(&batch_files, buffers).unwrap();
+        let mut row = 0usize;
+        let mut turn = 0usize;
+        while row < digits.len() {
+            let take = chunks[turn % chunks.len()].min(digits.len() - row);
+            batch
+                .push_block(&digits[row..row + take], row as u64)
+                .unwrap();
+            row += take;
+            turn += 1;
+        }
+        let batch = batch.finish(digits.len() as u64, &batch_files).unwrap();
+
+        assert_eq!(
+            level_bytes(&scalar_files),
+            level_bytes(&batch_files),
+            "{name}"
+        );
+        assert_eq!(scalar.n_datalines, batch.n_datalines, "{name}");
+        assert_eq!(scalar.position_bits, batch.position_bits, "{name}");
+        assert_eq!(scalar.n_superblocks, batch.n_superblocks, "{name}");
+        assert_eq!(scalar.n_sel, batch.n_sel, "{name}");
+        assert_eq!(scalar.n_occs_smaller, batch.n_occs_smaller, "{name}");
+        assert_eq!(scalar.aux_bytes, batch.aux_bytes, "{name}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn level_encoder_batches_match_scalar_across_boundaries() {
+        let lengths = [
+            0usize, 1, 63, 64, 65, 255, 256, 257, 511, 512, 513, 2_047, 2_048, 2_049, 8_191, 8_192,
+            8_193, 16_385, 70_001,
+        ];
+        for kind in ["uniform", "skewed", "runs", "constant"] {
+            for &rows in &lengths {
+                let digits = digit_stream(rows, kind, 0x9e37_79b9 + rows as u64);
+                assert_batch_matches_scalar(
+                    &format!("whole-{kind}-{rows}"),
+                    &digits,
+                    &[usize::MAX],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn level_encoder_batches_match_scalar_for_misaligned_chunks() {
+        for kind in ["uniform", "skewed"] {
+            for (index, chunks) in [
+                vec![1usize],
+                vec![7, 64, 3],
+                vec![63, 65],
+                vec![255, 1, 257],
+                vec![600],
+                vec![2_048, 1],
+                vec![8_191, 2, 8_193],
+            ]
+            .iter()
+            .enumerate()
+            {
+                let digits = digit_stream(25_013, kind, 17 + index as u64);
+                assert_batch_matches_scalar(&format!("chunks-{kind}-{index}"), &digits, chunks);
+            }
+        }
+    }
+
+    #[test]
+    fn block_scratch_stays_within_the_stream_buffer() {
+        for stream in [1usize, 5, 6, 3 * 1_024, 24 * 1_024, 1 << 20, 37_000_001] {
+            for lanes in [1usize, 2] {
+                let blocks = BlockScratch::new(stream, lanes);
+                let bytes = blocks.symbols.len() + blocks.digits.len() + blocks.buckets.len();
+                assert!(blocks.rows() >= 1);
+                assert_eq!(blocks.symbols.len(), blocks.rows() * 4);
+                if stream >= 6 {
+                    assert!(bytes <= stream, "{bytes} > {stream} with {lanes} lanes");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_qwtb_matches_owned_when_source_is_not_a_block_multiple() {
+        // The minimum budget stages 614 rows per block.
+        let block_rows = BlockScratch::new(
+            DirectBuffers::plan(min_buffer_bytes(), DIRECT_STREAMS)
+                .unwrap()
+                .stream,
+            1,
+        )
+        .rows();
+        for rows in [
+            1,
+            block_rows - 1,
+            block_rows,
+            block_rows + 1,
+            2 * block_rows - 1,
+            2 * block_rows + 1,
+            7 * block_rows + 13,
+        ] {
+            let values: Vec<u32> = (0..rows)
+                .map(|row| ((row * 29 + row / 5) % 3_001) as u32)
+                .collect();
+            assert_matches_owned(
+                &format!("partial-block-{rows}"),
+                &values,
+                min_buffer_bytes(),
+            );
+            assert_matches_owned(&format!("partial-block-24k-{rows}"), &values, 24 * 1_024);
+        }
+    }
+
+    #[test]
+    fn direct_qwtb_rejects_symbols_above_sigma_at_any_block_position() {
+        let block_rows = BlockScratch::new(
+            DirectBuffers::plan(min_buffer_bytes(), DIRECT_STREAMS)
+                .unwrap()
+                .stream,
+            1,
+        )
+        .rows();
+        let rows = 3 * block_rows + 5;
+        for bad_row in [
+            0,
+            block_rows / 2,
+            block_rows - 1,
+            block_rows,
+            2 * block_rows - 1,
+            rows - 1,
+        ] {
+            let mut values: Vec<u32> = (0..rows).map(|row| (row % 400) as u32).collect();
+            values[rows / 2] = 499;
+            values[bad_row] = 500;
+            let dir = test_dir("sigma-error");
+            let source = dir.join("source.u32");
+            let output = dir.join("output.qwtb");
+            let scratch = dir.join("scratch");
+            write_source(&source, &values);
+            let error = write_qwt256_u32_direct(
+                &source,
+                rows as u64,
+                499,
+                &output,
+                &scratch,
+                budget(rows as u64),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    DirectQwtBuildError::InvalidInput("source symbol exceeds declared sigma")
+                ),
+                "row {bad_row}: {error}"
+            );
+            assert!(!output.exists());
+            assert!(std::fs::read_dir(&scratch).unwrap().next().is_none());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn direct_qwtb_rejects_a_sigma_that_is_not_the_maximum() {
+        let values: Vec<u32> = (0..5_000).map(|row| (row % 300) as u32).collect();
+        let dir = test_dir("sigma-not-max");
+        let source = dir.join("source.u32");
+        write_source(&source, &values);
+        let error = write_qwt256_u32_direct(
+            &source,
+            values.len() as u64,
+            400,
+            &dir.join("output.qwtb"),
+            &dir.join("scratch"),
+            budget(values.len() as u64),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DirectQwtBuildError::InvalidInput("declared sigma is not the maximum source symbol")
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
