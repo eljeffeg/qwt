@@ -17,14 +17,17 @@ pub(super) const DIRECT_BLOCK_ROWS: u64 = 256;
 pub(super) const DIRECT_SUPERBLOCK_ROWS: u64 = 2_048;
 pub(super) const DIRECT_SELECT_SAMPLE_ROWS: u64 = 8_192;
 const DIRECT_STREAMS: u64 = 6;
-const MIN_STREAM_BUFFER_BYTES: u64 = 4 * 1_024;
+const MIN_STREAM_BUFFER_BYTES: u64 = 3 * 1_024;
+const MIN_AUX_BUFFER_BYTES: u64 = 4 * 1_024;
+const MAX_AUX_BUFFER_BYTES: u64 = 32 * 1_024;
+const AUX_BUFFER_BUDGET_DIVISOR: u64 = 8;
 static DIRECT_BUILD_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Limits enforced by the file-backed QWTB writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectQwtBuildBudget {
-    /// Total bytes available to the active input, four partition outputs, and
-    /// packed-level output buffers.
+    /// Total bytes available to the active input, the partition outputs, the
+    /// packed-level output, and the rank/select auxiliary-file buffers.
     pub buffer_bytes: u64,
     /// Maximum bytes simultaneously occupied by source, partition, and
     /// per-level support files. The final QWTB output is not scratch.
@@ -167,6 +170,51 @@ impl SourceSet {
     }
 }
 
+/// Heap-buffer split for one direct build.
+///
+/// The main streams (input, partition outputs, packed level data) share the
+/// budget evenly. The rank-superblock and select-sample writers receive a
+/// separate allowance, `budget / 8` clamped to the auxiliary minimum and
+/// maximum, split half to the superblock file and an eighth to each of the
+/// four select files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DirectBuffers {
+    pub(super) stream: usize,
+    pub(super) superblocks: usize,
+    pub(super) select: usize,
+}
+
+impl DirectBuffers {
+    /// Smallest buffer budget that can run `streams` main streams plus the
+    /// auxiliary writers.
+    pub(super) fn min_bytes(streams: u64) -> Result<u64, DirectQwtBuildError> {
+        streams
+            .checked_mul(MIN_STREAM_BUFFER_BYTES)
+            .and_then(|bytes| bytes.checked_add(MIN_AUX_BUFFER_BYTES))
+            .ok_or(DirectQwtBuildError::Overflow("minimum buffer bytes"))
+    }
+
+    pub(super) fn plan(buffer_bytes: u64, streams: u64) -> Result<Self, DirectQwtBuildError> {
+        let required = Self::min_bytes(streams)?;
+        if buffer_bytes < required {
+            return Err(DirectQwtBuildError::BufferBudget {
+                required,
+                limit: buffer_bytes,
+            });
+        }
+        let aux = (buffer_bytes / AUX_BUFFER_BUDGET_DIVISOR)
+            .clamp(MIN_AUX_BUFFER_BYTES, MAX_AUX_BUFFER_BYTES);
+        let convert = |bytes: u64| {
+            usize::try_from(bytes).map_err(|_| DirectQwtBuildError::Overflow("buffer bytes"))
+        };
+        Ok(Self {
+            stream: convert((buffer_bytes - aux) / streams)?,
+            superblocks: convert(aux / 2)?,
+            select: convert(aux / 8)?,
+        })
+    }
+}
+
 pub(super) struct LevelFiles {
     pub(super) data: PathBuf,
     pub(super) superblocks: PathBuf,
@@ -184,8 +232,8 @@ pub(super) struct LevelSummary {
 
 pub(super) struct LevelEncoder {
     data: BufWriter<File>,
-    superblocks: File,
-    select: [File; 4],
+    superblocks: BufWriter<File>,
+    select: [BufWriter<File>; 4],
     words: [u128; 4],
     line_rows: u16,
     n_datalines: u32,
@@ -199,15 +247,16 @@ pub(super) struct LevelEncoder {
 impl LevelEncoder {
     pub(super) fn new(
         files: &LevelFiles,
-        buffer_bytes: usize,
+        buffers: DirectBuffers,
     ) -> Result<Self, DirectQwtBuildError> {
-        let data = BufWriter::with_capacity(buffer_bytes, File::create(&files.data)?);
-        let superblocks = File::create(&files.superblocks)?;
+        let data = BufWriter::with_capacity(buffers.stream, File::create(&files.data)?);
+        let superblocks =
+            BufWriter::with_capacity(buffers.superblocks, File::create(&files.superblocks)?);
         let select = [
-            File::create(&files.select[0])?,
-            File::create(&files.select[1])?,
-            File::create(&files.select[2])?,
-            File::create(&files.select[3])?,
+            BufWriter::with_capacity(buffers.select, File::create(&files.select[0])?),
+            BufWriter::with_capacity(buffers.select, File::create(&files.select[1])?),
+            BufWriter::with_capacity(buffers.select, File::create(&files.select[2])?),
+            BufWriter::with_capacity(buffers.select, File::create(&files.select[3])?),
         ];
         Ok(Self {
             data,
@@ -302,7 +351,13 @@ impl LevelEncoder {
         }
         // Level files are transient scratch: they are read back through the
         // page cache and removed, so syncing them only costs a device flush.
+        // Flushing here, rather than in BufWriter's Drop, surfaces write
+        // errors and makes the lengths read below complete.
         self.data.flush()?;
+        self.superblocks.flush()?;
+        for select in &mut self.select {
+            select.flush()?;
+        }
 
         let mut cumulative = [0u64; 5];
         for symbol in 0..4 {
@@ -394,15 +449,7 @@ pub fn write_qwt256_u32_direct(
             "source length does not equal rows * 4",
         ));
     }
-    let required_buffers = DIRECT_STREAMS
-        .checked_mul(MIN_STREAM_BUFFER_BYTES)
-        .ok_or(DirectQwtBuildError::Overflow("minimum buffer bytes"))?;
-    if budget.buffer_bytes < required_buffers {
-        return Err(DirectQwtBuildError::BufferBudget {
-            required: required_buffers,
-            limit: budget.buffer_bytes,
-        });
-    }
+    let buffers = DirectBuffers::plan(budget.buffer_bytes, DIRECT_STREAMS)?;
     let levels = if rows == 0 {
         0
     } else {
@@ -446,8 +493,7 @@ pub fn write_qwt256_u32_direct(
         paths: vec![source.to_path_buf()],
         owned: false,
     };
-    let per_stream_buffer = usize::try_from(budget.buffer_bytes / DIRECT_STREAMS)
-        .map_err(|_| DirectQwtBuildError::Overflow("per-stream buffer bytes"))?;
+    let per_stream_buffer = buffers.stream;
     let copy_buffer_len = usize::try_from(budget.buffer_bytes.min(1024 * 1024))
         .map_err(|_| DirectQwtBuildError::Overflow("copy buffer bytes"))?;
     let mut peak_scratch = if levels == 0 { 0 } else { source_bytes };
@@ -467,7 +513,7 @@ pub fn write_qwt256_u32_direct(
                     .join(format!("level-{level}-select-{symbol}.bin"))
             }),
         };
-        let mut encoder = LevelEncoder::new(&level_files, per_stream_buffer)?;
+        let mut encoder = LevelEncoder::new(&level_files, buffers)?;
         let bucket_paths: [PathBuf; 4] = std::array::from_fn(|symbol| {
             workspace
                 .path
@@ -799,11 +845,48 @@ mod tests {
         file.sync_all().unwrap();
     }
 
-    fn budget(rows: u64) -> DirectQwtBuildBudget {
+    fn min_buffer_bytes() -> u64 {
+        DirectBuffers::min_bytes(DIRECT_STREAMS).unwrap()
+    }
+
+    fn budget_with_buffer(rows: u64, buffer_bytes: u64) -> DirectQwtBuildBudget {
         DirectQwtBuildBudget {
-            buffer_bytes: DIRECT_STREAMS * MIN_STREAM_BUFFER_BYTES,
+            buffer_bytes,
             scratch_bytes: rows.saturating_mul(16).saturating_add(1 << 20),
         }
+    }
+
+    fn budget(rows: u64) -> DirectQwtBuildBudget {
+        budget_with_buffer(rows, min_buffer_bytes())
+    }
+
+    fn assert_matches_owned(name: &str, values: &[u32], buffer_bytes: u64) {
+        let dir = test_dir(name);
+        let source = dir.join("source.u32");
+        let output = dir.join("output.qwtb");
+        let scratch = dir.join("scratch");
+        write_source(&source, values);
+        let rows = values.len() as u64;
+        let sigma = values.iter().copied().max().unwrap_or(0);
+        let stats = write_qwt256_u32_direct(
+            &source,
+            rows,
+            sigma,
+            &output,
+            &scratch,
+            budget_with_buffer(rows, buffer_bytes),
+        )
+        .unwrap();
+        let direct = std::fs::read(&output).unwrap();
+        assert_eq!(
+            direct,
+            qwt256_to_bytes(&QWT256::from(values.to_vec())).unwrap()
+        );
+        assert_eq!(stats.output_bytes, direct.len() as u64);
+        assert!(stats.output_bytes <= qwt256_u32_output_upper_bound(rows, sigma).unwrap());
+        assert!(stats.peak_scratch_bytes <= qwt256_u32_scratch_upper_bound(rows, sigma).unwrap());
+        assert!(std::fs::read_dir(&scratch).unwrap().next().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -929,15 +1012,17 @@ mod tests {
             &output,
             &scratch,
             DirectQwtBuildBudget {
-                buffer_bytes: DIRECT_STREAMS * MIN_STREAM_BUFFER_BYTES - 1,
+                buffer_bytes: min_buffer_bytes() - 1,
                 scratch_bytes: u64::MAX,
             },
         )
         .unwrap_err();
         assert!(matches!(
             buffer_error,
-            DirectQwtBuildError::BufferBudget { .. }
+            DirectQwtBuildError::BufferBudget { required, limit }
+                if required == min_buffer_bytes() && limit == min_buffer_bytes() - 1
         ));
+        assert!(!output.exists());
         let error = write_qwt256_u32_direct(
             &source,
             values.len() as u64,
@@ -945,7 +1030,7 @@ mod tests {
             &output,
             &scratch,
             DirectQwtBuildBudget {
-                buffer_bytes: DIRECT_STREAMS * MIN_STREAM_BUFFER_BYTES,
+                buffer_bytes: min_buffer_bytes(),
                 scratch_bytes: 1,
             },
         )
@@ -1001,6 +1086,59 @@ mod tests {
             qwt256_to_bytes(&QWT256::from(values)).unwrap()
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn direct_buffer_plan_stays_within_budget_and_meets_minimums() {
+        let minimum = min_buffer_bytes();
+        for buffer_bytes in [
+            minimum,
+            24 * 1_024,
+            minimum + 1,
+            64 * 1_024,
+            1 << 20,
+            37_000_000,
+            u64::MAX / 2,
+        ] {
+            let plan = DirectBuffers::plan(buffer_bytes, DIRECT_STREAMS).unwrap();
+            assert!(plan.stream as u64 >= MIN_STREAM_BUFFER_BYTES);
+            assert!(plan.superblocks > 0 && plan.select > 0);
+            let heap = DIRECT_STREAMS * plan.stream as u64
+                + plan.superblocks as u64
+                + 4 * plan.select as u64;
+            assert!(heap <= buffer_bytes, "{heap} > {buffer_bytes}");
+        }
+        assert!(matches!(
+            DirectBuffers::plan(minimum - 1, DIRECT_STREAMS),
+            Err(DirectQwtBuildError::BufferBudget { required, .. }) if required == minimum
+        ));
+    }
+
+    #[test]
+    fn direct_qwtb_accepts_exact_minimum_and_small_callers_with_parity() {
+        let values: Vec<u32> = (0..12_345)
+            .map(|row| ((row * 31 + row / 7) % 777) as u32)
+            .collect();
+        assert_matches_owned("minimum", &values, min_buffer_bytes());
+        assert_matches_owned("small-budget", &values, 24 * 1_024);
+        assert_matches_owned("large-budget", &values, 8 << 20);
+    }
+
+    #[test]
+    fn direct_qwtb_buffered_aux_files_match_owned_across_many_boundaries() {
+        let values: Vec<u32> = (0..300_007u64)
+            .map(|row| {
+                let spread = (row.wrapping_mul(2_654_435_761) >> 7) % 70_001;
+                if row % 3 == 0 {
+                    (row % 5) as u32
+                } else {
+                    spread as u32
+                }
+            })
+            .collect();
+        assert_matches_owned("multi-level-min", &values, min_buffer_bytes());
+        assert_matches_owned("multi-level-24k", &values, 24 * 1_024);
+        assert_matches_owned("multi-level-1m", &values, 1 << 20);
     }
 
     #[test]
