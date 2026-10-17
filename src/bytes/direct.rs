@@ -686,9 +686,8 @@ pub fn write_qwt256_u32_direct(
                 remaining -= block as u64;
                 let digits = &mut blocks.digits[..block];
                 let mut block_max = 0u32;
-                for (digit, encoded) in digits.iter_mut().zip(symbols.chunks_exact(4)) {
-                    let symbol =
-                        u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+                for (digit, encoded) in digits.iter_mut().zip(symbols.as_chunks::<4>().0) {
+                    let symbol = u32::from_le_bytes(*encoded);
                     block_max = block_max.max(symbol);
                     *digit = ((symbol >> shift) & 3) as u8;
                 }

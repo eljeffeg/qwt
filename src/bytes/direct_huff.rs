@@ -140,8 +140,8 @@ pub fn write_hqwt256_u32_direct(
             let symbols = &mut blocks.symbols[..block * 4];
             file.read_exact(symbols)?;
             remaining -= block as u64;
-            for encoded in symbols.chunks_exact(4) {
-                let symbol = u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+            for encoded in symbols.as_chunks::<4>().0 {
+                let symbol = u32::from_le_bytes(*encoded);
                 let frequency = frequencies.get_mut(symbol as usize).ok_or(
                     DirectQwtBuildError::InvalidInput("source symbol exceeds local alphabet"),
                 )?;
@@ -311,9 +311,8 @@ pub fn write_hqwt256_u32_direct(
                 let ids = &mut blocks.buckets[..block];
                 let digits = &mut blocks.digits[..block];
                 let mut staged = 0;
-                for (id, encoded) in ids.iter_mut().zip(symbols.chunks_exact(4)) {
-                    let symbol =
-                        u32::from_le_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+                for (id, encoded) in ids.iter_mut().zip(symbols.as_chunks::<4>().0) {
+                    let symbol = u32::from_le_bytes(*encoded);
                     let code =
                         codes
                             .get(symbol as usize)
