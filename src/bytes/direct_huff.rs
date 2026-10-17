@@ -7,9 +7,9 @@
 
 use super::direct::{
     align_output, append_file, container_output_upper_bound, file_len, remove_level_files,
-    validate_row_capacity, DirectQwtBuildBudget, DirectQwtBuildError, DirectQwtBuildStats,
-    DirectWorkspace, LevelEncoder, LevelFiles, OutputGuard, SourceSet, DIRECT_BLOCK_ROWS,
-    DIRECT_SELECT_SAMPLE_ROWS, DIRECT_SUPERBLOCK_ROWS,
+    validate_row_capacity, DirectBuffers, DirectQwtBuildBudget, DirectQwtBuildError,
+    DirectQwtBuildStats, DirectWorkspace, LevelEncoder, LevelFiles, OutputGuard, SourceSet,
+    DIRECT_BLOCK_ROWS, DIRECT_SELECT_SAMPLE_ROWS, DIRECT_SUPERBLOCK_ROWS,
 };
 use super::hqwb::LevelDir;
 use super::{align_up, ensure_le, FORMAT_VERSION, HEADER_SIZE, HQWB_MAGIC, HQWT_LEVEL_DIR_SIZE};
@@ -19,7 +19,6 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const DIRECT_HUFF_STREAMS: u64 = 7;
-const MIN_STREAM_BUFFER_BYTES: u64 = 4 * 1_024;
 const HUFF_METADATA_BYTES_PER_SYMBOL: u64 = 128;
 const HUFF_METADATA_FIXED_BYTES: u64 = 4 * 1_024;
 
@@ -32,9 +31,7 @@ pub fn hqwt256_u32_min_buffer_bytes(alphabet_size: u32) -> Result<u64, DirectQwt
         .ok_or(DirectQwtBuildError::Overflow(
             "Huffman metadata buffer bytes",
         ))?;
-    let stream_bytes = DIRECT_HUFF_STREAMS
-        .checked_mul(MIN_STREAM_BUFFER_BYTES)
-        .ok_or(DirectQwtBuildError::Overflow("minimum stream buffer bytes"))?;
+    let stream_bytes = DirectBuffers::min_bytes(DIRECT_HUFF_STREAMS)?;
     metadata_bytes
         .checked_add(stream_bytes)
         .ok_or(DirectQwtBuildError::Overflow(
@@ -128,8 +125,8 @@ pub fn write_hqwt256_u32_direct(
         });
     }
     let stream_budget = budget.buffer_bytes - metadata_bytes;
-    let per_stream_buffer = usize::try_from(stream_budget / DIRECT_HUFF_STREAMS)
-        .map_err(|_| DirectQwtBuildError::Overflow("per-stream buffer bytes"))?;
+    let buffers = DirectBuffers::plan(stream_budget, DIRECT_HUFF_STREAMS)?;
+    let per_stream_buffer = buffers.stream;
 
     let alphabet_len = usize::try_from(alphabet_size)
         .map_err(|_| DirectQwtBuildError::Overflow("Huffman alphabet size"))?;
@@ -274,7 +271,7 @@ pub fn write_hqwt256_u32_direct(
                     .join(format!("level-{level}-select-{symbol}.bin"))
             }),
         };
-        let mut encoder = LevelEncoder::new(&level_files, per_stream_buffer)?;
+        let mut encoder = LevelEncoder::new(&level_files, buffers)?;
         let bucket_paths: [PathBuf; 5] = std::array::from_fn(|bucket| {
             workspace
                 .path
@@ -561,12 +558,21 @@ mod tests {
     }
 
     fn assert_exact(name: &str, values: Vec<u32>) {
+        let alphabet_size = values.iter().copied().max().map_or(0, |value| value + 1);
+        assert_exact_with_buffer(name, values, budget(0, alphabet_size).buffer_bytes);
+    }
+
+    fn assert_exact_with_buffer(name: &str, values: Vec<u32>, buffer_bytes: u64) {
         let root = test_dir(name);
         let source = root.join("source.u32");
         let output = root.join("output.hqwb");
         let scratch = root.join("scratch");
         write_source(&source, &values);
         let alphabet_size = values.iter().copied().max().map_or(0, |value| value + 1);
+        let budget = |rows, _| DirectQwtBuildBudget {
+            buffer_bytes,
+            ..budget(rows, alphabet_size)
+        };
         let expected = hqwt256_to_bytes(&HQWT256::from(values.clone())).unwrap();
         let stats = write_hqwt256_u32_direct(
             &source,
@@ -588,6 +594,11 @@ mod tests {
             stats.peak_scratch_bytes <= budget(values.len() as u64, alphabet_size).scratch_bytes
         );
         assert!(std::fs::read_dir(&scratch).unwrap().next().is_none());
+
+        if values.len() > 10_000 {
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
 
         let aligned = AlignedBytes::from_slice(&actual);
         let view = HqwtView::<u32, 256>::from_bytes(&aligned).unwrap();
@@ -635,6 +646,36 @@ mod tests {
         assert_exact("skewed", values);
     }
 
+    fn skewed_values(rows: u64, alphabet: u64) -> Vec<u32> {
+        let mut values = (0..rows)
+            .map(|row| {
+                let hash = row.wrapping_mul(2_654_435_761) >> 5;
+                match row % 8 {
+                    0..=3 => (hash % 3) as u32,
+                    4..=5 => (hash % 40) as u32,
+                    _ => (hash % alphabet) as u32,
+                }
+            })
+            .collect::<Vec<_>>();
+        values.extend(0..alphabet as u32);
+        values
+    }
+
+    #[test]
+    fn exact_bytes_at_minimum_buffer_budget() {
+        let values = skewed_values(20_011, 300);
+        let minimum = hqwt256_u32_min_buffer_bytes(300).unwrap();
+        assert_exact_with_buffer("exact-minimum", values, minimum);
+    }
+
+    #[test]
+    fn exact_bytes_with_buffered_aux_files_across_many_boundaries() {
+        let values = skewed_values(300_007, 1_500);
+        let minimum = hqwt256_u32_min_buffer_bytes(1_500).unwrap();
+        assert_exact_with_buffer("multi-boundary-min", values.clone(), minimum);
+        assert_exact_with_buffer("multi-boundary-large", values, 8 << 20);
+    }
+
     #[test]
     fn rejects_non_dense_local_alphabet_and_cleans_scratch() {
         let root = test_dir("non-dense");
@@ -660,7 +701,7 @@ mod tests {
         write_source(&source, &values);
         let required_buffer = HUFF_METADATA_FIXED_BYTES
             + 5 * HUFF_METADATA_BYTES_PER_SYMBOL
-            + DIRECT_HUFF_STREAMS * MIN_STREAM_BUFFER_BYTES;
+            + DirectBuffers::min_bytes(DIRECT_HUFF_STREAMS).unwrap();
         assert_eq!(hqwt256_u32_min_buffer_bytes(5).unwrap(), required_buffer);
         let buffer_error = write_hqwt256_u32_direct(
             &source,
